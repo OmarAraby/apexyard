@@ -59,6 +59,37 @@ if [ -z "$PROTECTED" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Bootstrap-skill exemption (AgDR-0011 pattern, tightly scoped)
+#
+# Bootstrap-class skills (/setup, /split-portfolio, /handover, /update) may
+# legitimately seed a DIFFERENT repo's main — e.g. /split-portfolio Step 4
+# pushes the initial snapshot to a brand-new private portfolio repo that has
+# no base branch to open a PR against. Exempt ONLY when (a) an active
+# bootstrap marker names a skill on the configured bootstrap_skills list AND
+# (b) the repo the command targets is NOT the ops fork itself — so the ops
+# fork's own protected branches stay blocked even mid-bootstrap.
+# ---------------------------------------------------------------------------
+if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.claude/session/active-bootstrap" ]; then
+  ACTIVE_BOOTSTRAP=$(tr -d '[:space:]' < "$REPO_ROOT/.claude/session/active-bootstrap" 2>/dev/null)
+  if [ -n "$ACTIVE_BOOTSTRAP" ] && command -v config_get >/dev/null 2>&1 \
+     && config_get '.ticket.bootstrap_skills[]' 2>/dev/null | grep -qwF "$ACTIVE_BOOTSTRAP"; then
+    # Resolve the git toplevel the command actually runs in (honour a
+    # `cd <path> &&` prefix — same worktree-safe pattern as #549/#727).
+    BOOTSTRAP_TARGET_PATH=""
+    if echo "$COMMAND" | grep -qE '(^|[;&|[:space:]])cd[[:space:]]+\S'; then
+      BOOTSTRAP_TARGET_PATH=$(echo "$COMMAND" \
+        | grep -oE "cd[[:space:]]+(\"[^\"]*\"|'[^']*'|[^[:space:];&|]+)" \
+        | tail -n 1 \
+        | sed -E "s/^cd[[:space:]]+//; s/^[\"']//; s/[\"']\$//")
+    fi
+    BOOTSTRAP_TARGET_TOPLEVEL=$(git -C "${BOOTSTRAP_TARGET_PATH:-.}" rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$BOOTSTRAP_TARGET_TOPLEVEL" ] && [ "$BOOTSTRAP_TARGET_TOPLEVEL" != "$REPO_ROOT" ]; then
+      exit 0
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Block: git push <remote> <protected>
 #
 # Use _lib-extract-push-ref.sh to read the DESTINATION branch from the actual
