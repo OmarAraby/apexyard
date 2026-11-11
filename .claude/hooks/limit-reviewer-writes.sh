@@ -129,6 +129,27 @@ BODY_HINT="<ops-root>/.claude/session/reviews/bodies/"
 DENY="a review-class agent may use ${TOOL:-this tool} only to write its review body under $BODY_HINT. Do not change repository files, hooks, settings or review markers. Report findings to the orchestrator."
 
 [ -n "$TARGET" ] || lrw_block "the edit has no target path. $DENY"
+
+# Claude Code on Windows sends the Write path as C:\... or C:/... . That form
+# is absolute, but the /* test below rejected it, so no review agent could
+# write a body on Windows (OmarAraby/apexyard#4). Map it to the POSIX form
+# with the shared _windows_path_to_posix, as require-active-ticket.sh does
+# (me2resh/apexyard#1724). Check dot segments on the raw path first:
+# cygpath -u collapses `..`, so a later check would not see it. A
+# drive-relative path such as C:foo is left unchanged and stays blocked as
+# not absolute. With the library missing, the drive-letter path stays
+# unconverted and is blocked: the hook fails closed.
+case "$TARGET" in
+  [A-Za-z]:/*|[A-Za-z]:\\*)
+    case "/$(printf '%s' "$TARGET" | tr '\\' '/')/" in
+      */../*|*/./*) lrw_block "the path has a . or .. segment. $DENY" ;;
+    esac
+    if command -v _windows_path_to_posix >/dev/null 2>&1; then
+      TARGET=$(_windows_path_to_posix "$TARGET")
+    fi
+    ;;
+esac
+
 case "$TARGET" in
   /*) ;;
   *) lrw_block "use an absolute path. $DENY" ;;
