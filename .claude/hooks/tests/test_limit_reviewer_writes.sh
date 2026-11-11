@@ -227,6 +227,8 @@ PATH=$OLD_PATH
 unset FAKE_DRIVE_ROOT
 
 # On a real Windows host, also check the real cygpath and the real drive.
+# These cases add to the fake-cygpath cases above, which run on every host.
+# Other hosts print a note, not a SKIP: the runner fails a suite that skips.
 if command -v cygpath >/dev/null 2>&1 && REAL_WIN=$(cygpath -w "$OPS" 2>/dev/null) && [ -n "$REAL_WIN" ]; then
   expect "real windows: a body as C:\\... is allowed" allowed \
     "$(payload code-reviewer Write "$REAL_WIN\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
@@ -237,7 +239,7 @@ if command -v cygpath >/dev/null 2>&1 && REAL_WIN=$(cygpath -w "$OPS" 2>/dev/nul
   expect "real windows: a repo file is blocked" blocked \
     "$(payload code-reviewer Write "$REAL_WIN\\README.md")"
 else
-  echo "SKIP: real windows cases (no cygpath on this host)"
+  echo "NOTE: no cygpath on this host; the fake-cygpath cases above cover drive-letter paths"
 fi
 
 # --- Part 2: every Write-channel hook, then the Bash dispatcher --------------
