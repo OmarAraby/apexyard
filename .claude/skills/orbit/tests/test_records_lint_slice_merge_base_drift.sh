@@ -29,16 +29,19 @@ echo "PASS (a) ancestor R with no record change: exit 0 and NOTE"
 
 # Fail-before: pin the pre-change lint (this PR's dev merge-base), not
 # upstream/dev — after merge those refs hold the fixed lint (Tariq #1802).
+# A fork without upstream dev history lacks that commit. Print a NOTE, not a
+# SKIP, as test_git_alias_1748.sh does: the runner fails a suite that prints
+# SKIP, and the fail-before proof is a one-time check at PR time (rule 10a).
 lint_path=".claude/skills/orbit/lib/slice-pr-lint.sh"
 PRE_FIX_SHA="a791285d974de04359d8b0d1494878651231debc"
 unfixed_lib=$(mktemp)
 if ! git -C "$real_root" show "${PRE_FIX_SHA}:${lint_path}" > "$unfixed_lib" 2>/dev/null \
   || [ ! -s "$unfixed_lib" ]; then
   rm -f "$unfixed_lib"
-  echo "SKIP fail-before: base commit not available"
+  echo "NOTE: skip fail-before: base commit not available"
 elif grep -q 'slice_pr_merge_base_ok' "$unfixed_lib"; then
   rm -f "$unfixed_lib"
-  echo "SKIP fail-before: copied lint already defines slice_pr_merge_base_ok"
+  echo "NOTE: skip fail-before: copied lint already defines slice_pr_merge_base_ok"
 else
   cp "$sb/.claude/skills/orbit/lib/slice-pr-lint.sh" "$sb/.claude/skills/orbit/lib/slice-pr-lint.sh.fixed"
   cp "$unfixed_lib" "$sb/.claude/skills/orbit/lib/slice-pr-lint.sh"
