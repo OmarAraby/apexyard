@@ -164,6 +164,84 @@ got=$(/bin/bash -c '. "$1/.claude/hooks/_lib-review-markers.sh" && review_body_p
 if [ "$got" = "$BODY" ]; then ok "review_body_path names the sanctioned body file"; else bad "review_body_path printed '$got'"; fi
 expect "the review_body_path file is allowed" allowed "$(payload code-reviewer Write "$got")"
 
+# --- Windows drive-letter paths (OmarAraby/apexyard#4) ----------------------
+# Claude Code on Windows sends C:\... or C:/... . A fake cygpath maps drive Z:
+# onto $TMP so these cases run on every host, not only on Windows.
+FAKEBIN="$TMP/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/cygpath" <<'FAKE'
+#!/bin/bash
+[ "${1:-}" = -u ] || exit 1
+shift
+[ "${1:-}" = -- ] && shift
+case "${1:-}" in
+  [Zz]:\\*|[Zz]:/*) rest=${1#??}; printf '%s%s\n' "$FAKE_DRIVE_ROOT" "$(printf '%s' "$rest" | tr '\\' '/')" ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$FAKEBIN/cygpath"
+OLD_PATH=$PATH
+export FAKE_DRIVE_ROOT="$TMP"
+PATH="$FAKEBIN:$PATH"
+REL_OPS=${OPS#"$TMP"}
+WIN_BS="Z:$(printf '%s' "$REL_OPS" | tr '/' '\\')"
+WIN_FS="Z:$REL_OPS"
+BODY_NAME=me2resh__apexyard__42-rex.md
+
+expect "windows: a body as Z:\\... is allowed" allowed \
+  "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
+expect "windows: a body as Z:/... is allowed" allowed \
+  "$(payload code-reviewer Write "$WIN_FS/.claude/session/reviews/bodies/$BODY_NAME")"
+: > "$OPS/.claude/session/active-reviewers/s1/me2resh__apexyard__42-rex"
+expect "windows: an untyped sub-agent during an active review may write a body" allowed \
+  "$(payload untyped Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
+rm -f "$OPS/.claude/session/active-reviewers/s1/me2resh__apexyard__42-rex"
+expect "windows: a repo file as Z:\\... is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_BS\\README.md")"
+expect "windows: a hook file as Z:/... is blocked" blocked \
+  "$(payload security-reviewer Write "$WIN_FS/.claude/hooks/limit-reviewer-writes.sh")"
+expect "windows: a CEO marker as Z:\\... is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\me2resh__apexyard__42-ceo.approved")"
+expect "windows: a path outside the ops root is blocked" blocked \
+  "$(payload code-reviewer Write "Z:\\elsewhere.md")"
+expect "windows: a .. segment that leaves the body folder is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\..\\me2resh__apexyard__42-ceo.approved")"
+expect "windows: a .. segment that stays in the body folder is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\x\\..\\y.md")"
+expect "windows: a . segment with forward slashes is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_FS/.claude/session/reviews/bodies/./y.md")"
+expect "windows: a drive-relative path is blocked" blocked \
+  "$(payload code-reviewer Write "Z:bodies\\$BODY_NAME")"
+expect "windows: an Edit of a repo file as Z:\\... is blocked" blocked \
+  "$(payload code-reviewer Edit "$WIN_BS\\README.md")"
+expect "windows: the orchestrator is not limited" allowed \
+  "$(payload - Write "$WIN_BS\\README.md")"
+
+# With the path library missing, a drive-letter path stays unconverted and
+# fails closed.
+mv "$OPS/.claude/hooks/_lib-path-resolve.sh" "$TMP/path-lib.bak"
+expect "windows: no path library: a body as Z:\\... is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
+mv "$TMP/path-lib.bak" "$OPS/.claude/hooks/_lib-path-resolve.sh"
+PATH=$OLD_PATH
+unset FAKE_DRIVE_ROOT
+
+# On a real Windows host, also check the real cygpath and the real drive.
+# These cases add to the fake-cygpath cases above, which run on every host.
+# Other hosts print a note, not a SKIP: the runner fails a suite that skips.
+if command -v cygpath >/dev/null 2>&1 && REAL_WIN=$(cygpath -w "$OPS" 2>/dev/null) && [ -n "$REAL_WIN" ]; then
+  expect "real windows: a body as C:\\... is allowed" allowed \
+    "$(payload code-reviewer Write "$REAL_WIN\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
+  expect "real windows: a body as C:/... is allowed" allowed \
+    "$(payload code-reviewer Write "$(printf '%s' "$REAL_WIN" | tr '\\' '/')/.claude/session/reviews/bodies/$BODY_NAME")"
+  expect "real windows: a .. segment is blocked before cygpath collapses it" blocked \
+    "$(payload code-reviewer Write "$REAL_WIN\\.claude\\session\\reviews\\bodies\\x\\..\\y.md")"
+  expect "real windows: a repo file is blocked" blocked \
+    "$(payload code-reviewer Write "$REAL_WIN\\README.md")"
+else
+  echo "NOTE: no cygpath on this host; the fake-cygpath cases above cover drive-letter paths"
+fi
+
 # --- Part 2: every Write-channel hook, then the Bash dispatcher --------------
 FULL="$TMP/full"
 mkdir -p "$FULL/.claude" "$FULL/.claude/session/active-reviewers/s1" "$TMP/pins"
