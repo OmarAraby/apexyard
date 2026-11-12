@@ -27,13 +27,20 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/block-main-push.sh"
 LIB_SRC="$SRC_ROOT/.claude/hooks/_lib-extract-push-ref.sh"
+LIB_STRIP_HEREDOC_SRC="$SRC_ROOT/.claude/hooks/_lib-strip-heredoc.sh"
 LIB_CONFIG_SRC="$SRC_ROOT/.claude/hooks/_lib-read-config.sh"
 LIB_OPS_ROOT_SRC="$SRC_ROOT/.claude/hooks/_lib-ops-root.sh"
+LIB_PROTECTED_SRC="$SRC_ROOT/.claude/hooks/_lib-protected-branches.sh"
 
-for f in "$HOOK_SRC" "$LIB_SRC"; do
+for f in "$HOOK_SRC" "$LIB_SRC" "$LIB_STRIP_HEREDOC_SRC" "$LIB_PROTECTED_SRC"; do
   if [ ! -f "$f" ]; then
     echo "FAIL: required source missing: $f" >&2
     exit 1
@@ -82,7 +89,13 @@ make_sandbox() {
   # Install hook + libs.
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC"        "$sb/.claude/hooks/block-main-push.sh"
+  cp "$SRC_ROOT/.claude/hooks/_lib-git-global.sh" "$sb/.claude/hooks/"
+  cp "$SRC_ROOT/.claude/hooks/_lib-awk-fallback.sh" "$sb/.claude/hooks/"
   cp "$LIB_SRC"         "$sb/.claude/hooks/_lib-extract-push-ref.sh"
+  cp "$LIB_PROTECTED_SRC" "$sb/.claude/hooks/_lib-protected-branches.sh"
+  if [ -f "$LIB_STRIP_HEREDOC_SRC" ]; then
+    cp "$LIB_STRIP_HEREDOC_SRC" "$sb/.claude/hooks/_lib-strip-heredoc.sh"
+  fi
   if [ -f "$LIB_CONFIG_SRC" ]; then
     cp "$LIB_CONFIG_SRC"  "$sb/.claude/hooks/_lib-read-config.sh"
   fi
@@ -301,6 +314,154 @@ run_case "non-git command is no-op" \
 run_case "gh pr create is no-op" \
   "$SB" "$SB" "gh pr create --base dev --head feature/GH-1-foo" 0
 rm -rf "$SB"
+
+# run_case_stderr <label> <sandbox-root> <cwd-for-hook> <command> <want-rc> <want-substring>
+# Like run_case, but additionally asserts stderr contains <want-substring>.
+run_case_stderr() {
+  local label="$1" sb="$2" hook_cwd="$3" cmd="$4" want_rc="$5" want_substr="$6"
+  local input
+  input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
+  local got_rc got_stderr
+  got_stderr=$(cd "$hook_cwd" && echo "$input" | bash .claude/hooks/block-main-push.sh 2>&1 >/dev/null)
+  got_rc=$?
+
+  if [ "$got_rc" != "$want_rc" ]; then
+    echo "FAIL [$label]: want rc=$want_rc, got $got_rc" >&2
+    echo "    cmd:    $cmd" >&2
+    echo "    stderr: ${got_stderr:0:300}" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  if ! echo "$got_stderr" | grep -qF "$want_substr"; then
+    echo "FAIL [$label]: rc matched but stderr missing substring '$want_substr'" >&2
+    echo "    stderr: ${got_stderr:0:400}" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+
+# ---------------------------------------------------------------------------
+# me2resh/apexyard#1086 step 3 (PR-2, AgDR-0114): migration onto the shared
+# _lib-protected-branches.sh lib, plus the new --no-verify note.
+#
+# (g) The migration must not demote any former exit-2 site: every case in
+#     sections (a)-(e) above already re-proves this (identical rc=2/0
+#     expectations, now running against the migrated hook). This section
+#     adds NEW coverage the migration specifically introduces.
+# ---------------------------------------------------------------------------
+
+# --no-verify on a protected-branch push still blocks, AND the message
+# names --no-verify explicitly (the one shape with no git-native
+# replacement -- .githooks/pre-push would be skipped by this flag, this
+# PreToolUse hook is not).
+SB=$(make_sandbox "feature/GH-1-safe")
+run_case_stderr "push --no-verify to main blocks + message names --no-verify" \
+  "$SB" "$SB" "git push --no-verify origin main" 2 "does not bypass this check"
+rm -rf "$SB"
+
+# --no-verify on a protected-branch commit still blocks, same message.
+SB=$(make_sandbox "main")
+run_case_stderr "commit --no-verify on main blocks + message names --no-verify" \
+  "$SB" "$SB" "git commit --no-verify -m 'bad'" 2 "does not bypass this check"
+rm -rf "$SB"
+
+# A legitimate, non-protected push/commit with --no-verify must still pass
+# (the note only appears on an already-blocked command -- --no-verify never
+# manufactures a NEW block on its own).
+SB=$(make_sandbox "feature/GH-1-safe")
+run_case "push --no-verify to feature branch passes (no new block introduced)" \
+  "$SB" "$SB" "git push --no-verify origin feature/GH-2-bar" 0
+run_case "commit --no-verify on feature branch passes (no new block introduced)" \
+  "$SB" "$SB" "git commit --no-verify -m 'wip'" 0
+rm -rf "$SB"
+
+# ---------------------------------------------------------------------------
+# (h) Migrated hook resolves the SAME protected set as
+#     _lib-protected-branches.sh, driven by the SAME config key
+#     (.git.protected_branches[]) -- proves the lib migration is real, not
+#     cosmetic. An override that REPLACES the default list must be honoured
+#     identically to how .githooks/pre-push and .githooks/pre-commit honour
+#     it (they already source the same lib function).
+# ---------------------------------------------------------------------------
+SB=$(make_sandbox "main")
+mkdir -p "$SB/.claude"
+cat > "$SB/.claude/project-config.json" <<'CFG'
+{
+  "git": {
+    "protected_branches": ["release"]
+  }
+}
+CFG
+# main is no longer in the overridden list -> must be ALLOWED now.
+run_case "config override REPLACES default list: push to main now passes" \
+  "$SB" "$SB" "git push origin main" 0
+run_case "config override REPLACES default list: commit on main now passes" \
+  "$SB" "$SB" "git commit -m 'ok now'" 0
+# release IS in the overridden list -> must BLOCK.
+run_case "config override REPLACES default list: push to release blocks" \
+  "$SB" "$SB" "git push origin release" 2
+rm -rf "$SB"
+
+# ---------------------------------------------------------------------------
+# (i) Session-pinned ops-root scope (#1230)
+# ---------------------------------------------------------------------------
+# The settings wrapper uses the session pin to locate this hook. The pin must
+# not make a protected branch in an unrelated scratch repository look governed
+# by the pinned fork. A real command in the pinned fork must remain blocked.
+if grep -qF 'APEXYARD_OPS_SCOPE_GUARD=1' \
+  "$SRC_ROOT/.claude/hooks/dispatch-bash.sh"; then
+  echo "PASS [settings wiring enables ops-root scope guard]"
+  PASS=$((PASS+1))
+else
+  echo "FAIL [settings wiring enables ops-root scope guard]" >&2
+  FAIL=$((FAIL+1))
+  FAILED_CASES="${FAILED_CASES}settings wiring enables ops-root scope guard "
+fi
+
+OPS_SCOPE=$(make_sandbox "main")
+touch "$OPS_SCOPE/.apexyard-fork"
+SCRATCH_SCOPE=$(mktemp -d)
+make_git_repo "$SCRATCH_SCOPE" "main"
+MANAGED_SCOPE="$OPS_SCOPE/workspace/project"
+mkdir -p "$MANAGED_SCOPE"
+make_git_repo "$MANAGED_SCOPE" "main"
+PIN_SCOPE=$(mktemp -d)
+printf '%s\n' "$OPS_SCOPE" > "$PIN_SCOPE/ops-root-session-1230"
+
+run_scope_case() {
+  local label="$1" cwd="$2" cmd="$3" want_rc="$4"
+  local input got_rc got_stderr
+  input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
+  got_stderr=$(cd "$cwd" && \
+    APEXYARD_OPS_SCOPE_GUARD=1 \
+    CLAUDE_CODE_SESSION_ID=session-1230 \
+    APEXYARD_OPS_PIN_DIR="$PIN_SCOPE" \
+    bash "$OPS_SCOPE/.claude/hooks/block-main-push.sh" <<<"$input" 2>&1 >/dev/null)
+  got_rc=$?
+  if [ "$got_rc" = "$want_rc" ]; then
+    echo "PASS [$label]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [$label]: want rc=$want_rc, got $got_rc" >&2
+    echo "    stderr: ${got_stderr:0:300}" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="${FAILED_CASES}${label} "
+  fi
+}
+
+run_scope_case "pinned hook ignores main in unrelated scratch repo" \
+  "$SCRATCH_SCOPE" "git commit -m scratch" 0
+run_scope_case "pinned hook still blocks main in pinned ops fork" \
+  "$OPS_SCOPE" "git commit -m framework" 2
+run_scope_case "pinned hook ignores protected main in managed-project clone" \
+  "$MANAGED_SCOPE" "git commit -m project" 0
+run_scope_case "git -C target outside pinned ops fork is ignored" \
+  "$OPS_SCOPE" "git -C '$SCRATCH_SCOPE' commit -m scratch" 0
+rm -rf "$OPS_SCOPE" "$SCRATCH_SCOPE" "$PIN_SCOPE"
 
 # ---------------------------------------------------------------------------
 # Summary

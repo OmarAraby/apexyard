@@ -6,7 +6,7 @@
 | 2 | Tech Design → Build | Design approved, story tickets exist, **AgDR for key decisions** |
 | 3 | Starting code | Ticket exists, branch created, design review if UI work |
 | 3a | Starting a **migration** edit | Active ticket has the `migration` label **and** its body references a migration AgDR at `docs/agdr/AgDR-\d+-.*migration.*\.md`. Enforced by `require-migration-ticket.sh`. Use `/migration` to produce both artefacts in one flow. |
-| 3b | Design → Build (merging a **design-artifact** PR) | A PR carrying a technical design / migration AgDR / feature spec has a Solution Architect (Tariq) sign-off marker at `.claude/session/reviews/<pr>-architecture.approved` with a matching HEAD SHA. Enforced by `require-architecture-review.sh`. Produce the sign-off via `/design-review` (Tariq writes it on APPROVED) or `/approve-architecture`. |
+| 3b | Design → Build (merging a **design-artifact** PR) | A PR carrying a technical design / migration AgDR / feature spec has a Solution Architect (Tariq) sign-off marker at `.claude/session/reviews/<owner>__<repo>__<pr>-architecture.approved` with a matching HEAD SHA. Enforced by `require-architecture-review.sh`. Produce the sign-off via `/design-review` (Tariq writes it on APPROVED) or `/approve-architecture`. |
 | 4 | Creating PR | Tests pass, checks pass, **> 80% coverage**, **AgDR linked if decisions made** |
 | 5 | Merging PR | 2 reviews (agent + human), CI green, **commit SHA matches review** |
 | 6 | Ticket → Done | QA verified, signed off |
@@ -48,9 +48,25 @@ A small set of **bootstrap-class skills** runs before any portfolio is configure
 - `/update` — upstream sync (touches framework files; the only "ticket" for this work is the sync itself)
 - `/split-portfolio` — destructive migration to split-portfolio mode (rewriting fork-root files; existing private-name tickets being redacted *as the work proceeds*)
 
-The list lives at `.claude/project-config.defaults.json` → `ticket.bootstrap_skills`. Adopters extend it via `.claude/project-config.json` shallow-merge if they have custom bootstrap skills.
+The list lives at `.claude/project-config.defaults.json` → `ticket.bootstrap_skills`. Adopters replace this array via `.claude/project-config.json` if they have custom bootstrap skills. Config objects merge recursively, while arrays replace the inherited array wholesale, so retain the shipped entries explicitly when extending the list.
 
-**Mechanism:** each bootstrap skill writes its name to `.claude/session/active-bootstrap` on entry and removes the file on completion. The hook reads the marker and exempts skills on the configured list. The `clear-bootstrap-marker.sh` SessionStart hook sweeps stale markers from interrupted sessions so a crashed / killed skill can't leave the exemption open forever.
+**Mechanism:** each bootstrap skill writes its name to the session path from `active_bootstrap_marker_path` on entry and removes the file on completion. The hook reads the marker and exempts skills on the configured list. The `clear-bootstrap-marker.sh` SessionStart hook clears the current session's marker so a crashed / killed skill can't leave the exemption open forever.
+
+### Out-of-repo exemption (apexyard#883)
+
+The pre-build gate exists to protect **governed content** — the ops fork itself and every registered `workspace/<project>` clone. A write target entirely outside those trees, and not inside any git repository at all (a home dotfile like `~/.zshrc`, `/etc`-style machine config, `/tmp` scratch files), is outside the gate's jurisdiction: there is nothing here for a ticket to track, and on a fork with GitHub Issues disabled there would otherwise be no legitimate way to satisfy the gate for routine machine setup.
+
+`require-active-ticket.sh` resolves the write target's real (symlink-free) path and exempts it only when **all three** of the following hold:
+
+- outside the ops fork
+- outside every registered `workspace/<project>`
+- not inside any git repository at all
+
+This is deliberately narrower than "not inside a *registered* repo" — being inside some unrelated, unregistered git repository does **not** exempt a write; only a target with no git repository anywhere in its ancestry qualifies. Any symlink in the target path prevents the exemption, including a dangling link at the final component. An unresolvable or ambiguous target (an unextractable Bash write-target, in particular) is never exempted here — it falls straight through to the ticket gate, unchanged. See `require-active-ticket.sh`'s "Out-of-governance exemption" comment block for the full fail-closed reasoning, and `.claude/hooks/tests/test_require_active_ticket_bash.sh` cases 31–38 for the test coverage.
+
+**Reviewer scratch clone exception (#1402):** A sanctioned reviewer can write inside a standalone git clone under a temporary directory. The clone must have an origin remote. The hook requires this session's active-reviewer marker for Rex, Security, or Architecture review. It checks every write target against the ops fork and managed workspace before allowing the write. Any symlink in the target path prevents the exemption, including a dangling link or a link within the clone. Linked `git worktree add` checkouts and unresolved targets remain gated. See [AgDR-0188](../../docs/agdr/AgDR-0188-reviewer-scratch-clone-ticket-gate.md).
+
+**Reviewer scratchpad exception (#1417):** A sanctioned reviewer can write under this session's scratchpad without a ticket. The hook reads `scratchpad_dir` when the harness sends it. The path must contain this session id as a path segment. It must sit under `/tmp`, `/var/tmp`, `TMPDIR`, or `CLAUDE_CODE_TMPDIR`. It must not be the ops fork or a registered workspace. A `..` segment or a symlink keeps the gate closed. When `scratchpad_dir` is absent, only a temp path that contains this session id as a path segment qualifies. A present value that fails a check does not use that wider rule. See [AgDR-0231](../../docs/agdr/AgDR-0231-reviewer-scratchpad-ticket-gate.md).
 
 See AgDR-0011 + me2resh/apexyard#150 for the full design rationale.
 
@@ -80,7 +96,7 @@ In the ApexYard SDLC a technical design lands as a **committed document** — a 
 
 Any merge of a PR whose diff carries a design artifact requires:
 
-1. A Solution Architect sign-off marker at `.claude/session/reviews/<pr>-architecture.approved`
+1. A Solution Architect sign-off marker at `.claude/session/reviews/<owner>__<repo>__<pr>-architecture.approved` (repo-qualified, AgDR-0060 — the bare-number form is read by no gate)
 2. Whose SHA matches the PR's HEAD on GitHub
 
 Default design-artifact patterns (configurable via `.claude/project-config.json` → `design_paths` to REPLACE, `design_paths_exclude` to additively carve out):
@@ -129,6 +145,12 @@ In Progress → In Review → QA → Done
                     MANDATORY STOP
                     QA must verify
 ```
+
+### What counts as QA evidence
+
+If the ticket touches a rendered surface, the QA record must state, per acceptance criterion, whether it was verified in a browser. The not-verified list is mandatory: a QA agent that could not boot the surface must name the affected criteria rather than stay silent. A database query, a source read, or a green test suite is not evidence that a rendered criterion is met. **Reject a PASS whose evidence does not match the criterion.**
+
+A ticket with no rendered surface needs no browser evidence. Full requirement and sign-off shape: `roles/engineering/qa-engineer.md` § "Browser Evidence (rendered surfaces only)"; the design-gate equivalent is `roles/design/ui-designer.md` § "Browser evidence is a named deliverable". No hook enforces this — a `PreToolUse` hook cannot see whether a sub-agent opened a browser, so the orchestrator must reject a report that skips the breakdown.
 
 ---
 

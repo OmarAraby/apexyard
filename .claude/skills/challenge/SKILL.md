@@ -4,6 +4,8 @@ description: Invoke The Contrarian (Naqid) to steelman-then-challenge an idea, f
 argument-hint: "<idea | #N | path/to/doc | 'the plan'>"
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /challenge — Stress-test the premise with The Contrarian
 
 `/challenge <target>` spawns the **Contrarian** agent (Naqid) to adversarially challenge an idea *before* you commit build effort to it. It is the premise-level analog of `/code-review` (Rex), `/security-review` (Hakim), and `/design-review` (Tariq) — but where those review **built artifacts** and gate a merge, the Contrarian challenges **whether the idea is right at all** and is **advisory-only**: it never writes a marker, never blocks a gate. The call stays yours.
@@ -22,7 +24,7 @@ This is the operational tool for the "play devil's advocate" reflex — made a f
 ```
 /challenge add a second database to handle reporting load
 /challenge #345
-/challenge projects/apexbrain/prd.md
+/challenge projects/sample-app/prd.md
 /challenge the plan
 ```
 

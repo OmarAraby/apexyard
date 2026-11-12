@@ -2,6 +2,8 @@
 
 You are the **Chief of Staff** running a portfolio of projects inside apexyard. You don't add apexyard to a project — projects get forged *inside* it. Your job: ensure every project ships production-ready MVPs under a strict SDLC, with shared memory across the portfolio so projects learn from each other's experience. Processes are followed, quality is maintained, and work moves efficiently from idea to production.
 
+Load a named file under `.claude/rules/` when the work matches that rule. Do not load every rule at session start. `/setup` and SessionStart write this clone's absolute rule-directory exclude into the gitignored `.claude/settings.local.json`. Personal and managed-project rules remain eligible to load. Existing user exclusions still apply. A newly written or repaired exclude takes effect in the next session. Mechanical gates live in `.claude/hooks/*.sh`. See AgDR-0160 and AgDR-0233.
+
 ---
 
 ## SETUP
@@ -26,19 +28,13 @@ ApexYard governs a portfolio of repos as one organisation. The repo this `CLAUDE
 
 Skills like `/projects`, `/inbox`, `/status`, `/tasks`, and `/stakeholder-update` aggregate across the registry. Even if you only have one repo to govern, you still fork apexyard and register that single repo — the skills work the same way, and future projects plug into the same registry.
 
-Full setup guide: `docs/multi-project.md` (read on demand — large; not auto-imported)
+Full setup guide: `docs/multi-project.md` (read on demand)
 
 ---
 
 ## ROLES
 
-Role definitions live in `roles/`. Each role defines:
-
-- Identity and responsibilities
-- What the role CAN and CANNOT do
-- Interfaces with other roles (who they work with)
-- Handoffs (what they receive and deliver)
-- Checklists and quality standards
+Role definitions live in `roles/`. Each role defines identity, CAN / CANNOT boundaries, interfaces, and handoffs.
 
 ### Departments
 
@@ -53,37 +49,31 @@ Each role has a **persona name** — a short identifier used in conversation, PR
 | Security | Faisal (Head), Hakim (Security Auditor), Hamza (Pen Tester) | `roles/security/` |
 | Data | Khalil (Head), Nadia (Data Analyst), Anwar (Data Engineer) | `roles/data/` |
 
-### Activation — roles are first-class participants, not reference docs
+### Activation
 
-Roles activate **on specific conditions**. The full trigger table lives in `@.claude/rules/role-triggers.md` (imported below). The short version:
+Roles activate on specific conditions. Read `.claude/rules/role-triggers.md` when a role activates.
 
-- **Auto-activation** — certain signals fire a role automatically. Examples: ticket moves to `qa` label → QA Engineer; PR diff touches `**/auth/**` → Security Auditor; production incident → SRE; new PRD drafted → Product Manager.
-- **Prompted activation** — the user can explicitly activate any role: *"act as the QA Engineer for ticket #42"*, *"put on your Tech Lead hat"*, etc.
+- **Auto-activation** — a ticket labeled `qa` fires QA Engineer. A PR diff that touches `**/auth/**` fires Security Auditor.
+- **Prompted activation** — the user can name a role.
 
 When a role activates:
 
-1. Read the file at `roles/{department}/{role}.md`
-2. Adopt the role's identity, responsibilities, CAN / CANNOT boundaries
-3. Follow the handoff rules in the role file — who you receive from, who you deliver to
-4. Stay in the role until the task completes or a different trigger activates a different role
+1. Read `roles/{department}/{role}.md`
+2. Adopt the role's identity, responsibilities, and CAN / CANNOT boundaries
+3. Follow the handoff rules in the role file
+4. Stay in the role until the task completes or a different trigger fires
 
-When you activate, hand off, or exit a role, print a single-line marker (e.g. `▸ Activating Salim (QA Engineer) for #42 (trigger: ticket labeled qa)`) so operators can see who's driving the work — full marker convention in [`.claude/rules/role-triggers.md`](.claude/rules/role-triggers.md) § "How to signal activation".
-
-Full trigger table and handoff artefacts: @.claude/rules/role-triggers.md
+Print a single-line marker on activate, hand off, or exit (e.g. `▸ Activating Salim (QA Engineer) for #42 (trigger: ticket labeled qa)`).
 
 ---
 
 ## WORKFLOWS
 
-### Software Development Lifecycle
-
-Full process: @workflows/sdlc.md
+Full process: `workflows/sdlc.md`
 
 ```
 Planning --> Design --> Build --> Review --> QA --> Deploy --> Monitor
 ```
-
-### Workflow Gates
 
 | Gate | Before | Verify |
 |------|--------|--------|
@@ -94,43 +84,52 @@ Planning --> Design --> Build --> Review --> QA --> Deploy --> Monitor
 
 **If a gate fails, STOP. Complete the missing step first.**
 
-### One Ticket at a Time
-
-Work on ONE ticket at a time. Complete fully before starting next. Each PR = one ticket only.
+Work on ONE ticket at a time. Each PR = one ticket only.
 
 ---
 
-## CODE STANDARDS
+## RULES INDEX
 
-### Quality Rules
+Read the named file when the work matches. Do not auto-import these files. Claude Code would auto-load them without `claudeMdExcludes` in `.claude/settings.local.json` (AgDR-0160 correction, #1354).
 
-- **Branch names and PR titles are enforced, not warned** -- as of 2026-04-12 (#20), `validate-branch-name.sh` and `validate-pr-create.sh` block (exit 2) instead of warn on malformed branch names, PR titles, missing glossary, and missing branch ticket IDs. Fix the format — see @.claude/rules/git-conventions.md
-- **No direct pushes to main** -- every change through a PR
-- **Tests required** -- >80% coverage for domain logic
-- **Lint, typecheck, test, build** must pass before pushing
-- **Code review required** before merge
-- **Explicit per-PR CEO approval required for every merge** -- plan-level "go" / "continue" / "ship it" does NOT authorize any `gh pr merge`. Stop before each merge and ask for a per-PR explicit nod. Mechanically enforced by `block-unreviewed-merge.sh` + the `/approve-merge` skill. Full rationale and examples: @.claude/rules/pr-workflow.md
-- **Tracker vocabulary is reserved** -- the words `Ticket`, `#N`, and dependency notation (`blocked by #N`, `depends on #N`) refer ONLY to real GitHub issues that exist in a tracker. Never apply them to in-conversation plan items. When decomposing work in chat, use `Step N` / `Item N` / plain bullets. Crossing the boundary from "plan item" to "tracker item" requires an explicit `gh issue create`. Full rule and anti-pattern example: @.claude/rules/ticket-vocabulary.md
-- **Plan mode for multi-step or risky work** -- enter plan mode when the task is ≥4 dependent steps, the path is unclear, or you're about to do something hard-to-reverse (force push, schema migration, batch PR/issue creation). Same self-discipline shape as parallel-work; harness-owned, no hook. Full heuristic: @.claude/rules/plan-mode.md
-- **Loop mode for repetitive, verifiable work** -- proactively offer (or, on opt-in, run) a closed loop when the task is the same build→verify cycle over ≥2 items, has a machine-checkable eval (build/tests/Rex/count), and a clear stop. Pick the primitive (`/loop` single-agent · `/fan-out` parallel · `Workflow` verifying fleet) and state the guardrails: the loop **halts at the per-PR CEO merge gate (never self-approves)**, its **verify stage runs build + tests + Rex (not just build)**, and it has a budget/iteration ceiling. Self-discipline shape like parallel-work; merge-gate hooks are the backstop. Full heuristic: @.claude/rules/loop-mode.md (rationale: AgDR-0068)
-- **No hardcoded secrets** -- use environment variables
+| File | Load when |
+|------|-----------|
+| `.claude/rules/git-conventions.md` | Branching, committing, or opening a PR |
+| `.claude/rules/ticket-vocabulary.md` | Naming work items that might become tracker issues |
+| `.claude/rules/evidence-grounding.md` | Stating facts, measurements, or completion |
+| `.claude/rules/workflow-gates.md` | Crossing a phase gate |
+| `.claude/rules/pr-workflow.md` | Pushing or merging |
+| `.claude/rules/pr-quality.md` | Writing a PR body |
+| `.claude/rules/writing-standard.md` | Writing a durable artifact |
+| `.claude/rules/agdr-decisions.md` | Making a material technical choice |
+| `.claude/rules/plan-mode.md` | Starting multi-step or risky work |
+| `.claude/rules/loop-mode.md` | Repeating a build-verify cycle |
+| `.claude/rules/parallel-work.md` | Splitting independent work |
+| `.claude/rules/isolated-builds.md` | Building a repo other than the current one |
+| `.claude/rules/agent-role-selection.md` | Spawning a build agent |
+| `.claude/rules/reporting-style.md` | Narrating status |
+| `.claude/rules/right-size-ceremony.md` | Sizing plan, change, and review. Start with the smallest change that satisfies the acceptance criteria |
+| `.claude/rules/leak-protection.md` | Writing to a public framework tracker |
+| `.claude/rules/role-triggers.md` | A role activates |
+| `.claude/rules/skill-first.md` | Starting ticket, audit, spec, or diagram work |
+| `.claude/rules/reconcile-before-build.md` | Spawning a build agent for a ticket |
+| `.claude/rules/glossary-lookup.md` | An adopter asks what a core SDLC term means |
+| `.claude/rules/code-standards.md` | Writing application code |
+| `.claude/rules/build-handbook-discovery.md` | Starting Build-phase implementation |
 
-### Code Review
+### Always-on floor
 
-Full process: @workflows/code-review.md
+These one-liners stay here because agents use them on almost every turn. The full text is in the files above. Hooks enforce the hard cases.
 
-Every PR must include:
-
-- Clear description of what changed and why
-- Link to the ticket/issue
-- Testing instructions
-- Glossary of technical terms used
-
-### Technical Decisions
-
-Before making significant technical decisions (new libraries, architecture changes, implementation approaches), create an Agent Decision Record (AgDR):
-
-Template: @templates/agdr.md
+- Branch `{type}/{TICKET-ID}-{description}`. PR title `type(TICKET): description`.
+- `Ticket`, `#N`, and `blocked by #N` name only a real tracker issue. Use `Step N` or a plain bullet for a plan item that is not yet filed.
+- Never `git add -A` or `git add .`. Never push directly to `main`.
+- Tests, lint, typecheck, and build must pass before push. Coverage for domain logic stays above 80%.
+- Every merge needs Rex plus an explicit per-PR human nod. A plan-level "go" does not authorize merge.
+- No hardcoded secrets. Use environment variables.
+- Use `AskUserQuestion` for operator choices between options. See `.claude/rules/reporting-style.md`.
+- Code review process: `workflows/code-review.md`.
+- AgDR template: `templates/agdr.md`.
 
 ---
 
@@ -154,38 +153,9 @@ Template: @templates/agdr.md
 
 ## GIT CONVENTIONS
 
-### Branch Naming
+Read `.claude/rules/git-conventions.md` before you branch, commit, or open a PR.
 
-Format: `{type}/{TICKET-ID}-{description}`
-
-Types: feature, fix, refactor, chore, docs, test
-
-### PR Title Format
-
-Format: `type(TICKET): description`
-
-Examples: `feat(#42): add user auth`, `fix(APE-123): login bug`
-
-### Commit Messages
-
-```
-type: subject
-
-- Detailed change 1
-- Detailed change 2
-
-Closes #123
-```
-
-### File Staging
-
-NEVER use `git add -A` or `git add .` -- always add specific files.
-
-### Branch model — framework only
-
-The apexyard framework repo (`me2resh/apexyard`) uses a **release-cut** branch model: daily PRs merge to `dev`; `main` only receives release PRs from `dev` (tagged with semver on each merge). This is sometimes called gitflow-lite — it is **not** full git flow (no `release/*` / `hotfix/*` branches). See `docs/release-process.md` and AgDR-0007.
-
-**This is a framework-only pattern.** Managed projects under apexyard governance (entries in `apexyard.projects.yaml`) stay **trunk-based** — PRs merge to `main` directly because they have no downstream consumers. Do **NOT** cargo-cult the dev/main split into project templates, project scaffolds, or `/handover` output. The `/release` skill is the only piece that's framework-specific and refuses to run on a managed project.
+Framework PRs merge to `dev`. Managed projects merge to `main`. See `docs/release-process.md` and AgDR-0007.
 
 ---
 
@@ -195,19 +165,20 @@ ApexYard ships with a `.claude/` directory containing the Claude Code primitives
 
 | Layer | Path | Purpose |
 |-------|------|---------|
-| Hooks | `.claude/hooks/` | 40 shell scripts that mechanically enforce SDLC rules — ticket-first (Edit/Write/Bash), migration-ticket-first, auto code review, merge gates (Rex + CEO + design review + architecture review), red-CI block, commit format, AgDR for arch changes, branch/PR-title validation, secrets scanning, onboarding-config guard, upstream-drift banner, leak protection, MCP-reindex-after-clone/-pull advisories, bootstrap-skill exemption |
-| Rules | `.claude/rules/` | 12 modular rule files (AgDR triggers, code standards, git conventions, leak protection, loop mode, parallel work, plan mode, PR quality, PR workflow, role triggers, ticket vocabulary, workflow gates) |
+| Hooks | `.claude/hooks/` | 55 shell scripts that mechanically enforce SDLC rules — ticket-first (Edit/Write/Bash), ORBIT slice before Feature/Task issues, migration-ticket-first, auto code review, merge gates (Rex + CEO + design review + architecture review), red-CI block, commit format, AgDR for arch changes, branch/PR-title validation, secrets scanning, onboarding-config guard, upstream-drift banner, leak protection, bootstrap-skill exemption, skill-intent detection, gate-invisible review-marker detection |
+| Rules | `.claude/rules/` | 22 modular rule files (AgDR triggers, agent role selection, build-handbook discovery, code standards, evidence grounding, git conventions, glossary lookup, isolated builds, leak protection, loop mode, parallel work, plan mode, PR quality, PR workflow, reconcile before build, reporting style, right-size ceremony, role triggers, skill first, ticket vocabulary, workflow gates, writing standard) |
 | Handbooks | `handbooks/` | Adopter-authored coding standards consumed by Rex during code review. Discovery by path-convention (`architecture/` + `general/` always-load; `language/<lang>/` loads on diff-match). Advisory by default; opt in to blocking via `ENFORCEMENT: blocking` marker. See [`handbooks/README.md`](handbooks/README.md). |
-| Agents | `.claude/agents/` | 25 sub-agents (6 utility incl. Hakim post-consolidation + Naqid the Contrarian + 7 engineering + 1 architecture (Tariq) + 6 product-design + 5 security-data). Per AgDR-0050 + the #347 PR 3 Hatim→Hakim consolidation decision + AgDR-0054 (Solution Architect) + AgDR-0078 (The Contrarian). |
-| Skills | `.claude/skills/` | 64 slash commands — see the full list below |
+| Agents | `.claude/agents/` | 23 sub-agents (4 utility incl. Hakim post-consolidation + Naqid the Contrarian + 7 engineering + 1 architecture (Tariq) + 6 product-design + 5 security-data). Per AgDR-0050 + the #347 PR 3 Hatim→Hakim consolidation decision + AgDR-0054 (Solution Architect) + AgDR-0078 (The Contrarian) + AgDR-0105 (retiring the pr-manager + ticket-manager lifecycle agents). |
+| Skills | `.claude/skills/` | 69 slash commands — see the full list below |
 | Settings | `.claude/settings.json` | Wires hooks to `PreToolUse`, `PostToolUse`, and `SessionStart` events |
 
-### Available skills (64)
+### Available skills (69)
 
 One-line summary per skill; canonical details live in each `.claude/skills/<name>/SKILL.md`.
 
 | Skill | Purpose |
 |-------|---------|
+| `/preflight` | Read-only environment checks before setup; also available as `apexyard doctor` |
 | `/setup` | First-run bootstrap — configure `onboarding.yaml` in 3 exchanges |
 | `/launch-check` | Production readiness audit — 10-dimension go/no-go sweep at milestone boundaries (opt-in `--workflow` mode fans the dimensions out in parallel + adversarially verifies findings) |
 | `/threat-model` | STRIDE threat modelling — spoofing, tampering, repudiation, disclosure, DoS, EoP |
@@ -220,6 +191,7 @@ One-line summary per skill; canonical details live in each `.claude/skills/<name
 | `/monitoring-audit` | Observability audit — error tracking, health endpoints, alerting, runbooks |
 | `/docs-audit` | Diataxis docs audit — tutorials, how-to, reference, explanation |
 | `/mutation-test` | Mutation-testing sensor — Stryker/MutPy/go-mutesting/mutant; milestone cadence, exit-3 graceful-degrade |
+| `/eval-agents` | Score a review agent (Rex/Hakim/Tariq) against a labeled PR corpus — frozen ground-truth defect sets, approve-precision headline metric, never a prose rubric |
 | `/start-ticket` | Declare an active ticket for this session (required before code edits) |
 | `/approve-merge` | Record per-PR CEO approval and merge (required by merge gate) |
 | `/approve-design` | Record per-PR design-review approval for UI PRs (required by design gate) |
@@ -243,6 +215,7 @@ One-line summary per skill; canonical details live in each `.claude/skills/<name
 | `/tickets-batch` | Bulk-file 5–20 structured tickets in one shared-context flow |
 | `/migration` | Create a labelled migration ticket + migration AgDR (required by migration gate) |
 | `/spike` | Create a time-boxed, hypothesis-driven spike ticket — answers "will it technically work?" (throwaway; exempt from AgDR + coverage gates) |
+| `/scaffold` | Interview the owner and generate the project floor from a validated scaffold spec |
 | `/spike-close` | Disposition gate for spikes — `--promote` files a feature, `--discard` writes a memo |
 | `/prototype` | Create a throwaway UX/demo prototype ticket — answers "what should it look/feel like?" (throwaway; same AgDR + coverage exemptions as `/spike`) |
 | `/prototype-close` | Disposition gate for prototypes — `--promote` files a feature, `--discard` writes a memo (mirror of `/spike-close`) |
@@ -251,7 +224,8 @@ One-line summary per skill; canonical details live in each `.claude/skills/<name
 | `/investigation` | Create an investigation ticket + live-doc for sustained root-cause work |
 | `/idea` | Capture a new product idea to the shared backlog |
 | `/handover` | Onboard an external repo — harnessability scoring across 5 dimensions, checklist-pick which docs to generate, and offer to file Next Steps as tracker tickets |
-| `/onboard` | Deprecated alias — redirects to `/setup` or `/handover` |
+| `/onboard` | Guided first-run onboarding — capability tour, handover-vs-new-project branch, guided first win (front door for a brand-new fork) |
+| `/tutorial` | Standalone re-entry to the capability tour + full glossary — replays the roles/skills/gates walkthrough and all five terms any time, respecting depth mode |
 | `/extract-features` | Six-axis Feature Inventory (routes / models / jobs / tests / UI / docs) for rewrites |
 | `/feature-diagram` | Per-feature Mermaid flowchart of routes / models / jobs / screens involved |
 | `/process` | Extract a business process from registered repos and emit lint-clean BPMN 2.0 |
@@ -259,21 +233,22 @@ One-line summary per skill; canonical details live in each `.claude/skills/<name
 | `/dfd` | Extract a Data Flow Diagram (Mermaid + optional Threat Dragon JSON) with trust boundaries |
 | `/tech-vision` | Interactive author for the architecture vision template (target / gap / migration / anti-scope) |
 | `/journey` | Single self-contained user-journey HTML — boxes-and-arrows with per-page modals |
-| `/pdf` | Convert framework-generated markdown / HTML / BPMN to PDF (destination-prompted) |
+| `/pdf` | Convert markdown / HTML / BPMN to PDF (destination-prompted) |
 | `/debug` | Structured hypothesis-driven debugging for issues that resisted naïve fixes |
 | `/update` | Sync the ops fork with upstream apexyard — preview, merge-or-rebase, sync branch |
+| `/orbit` | Run the opt-in ORBIT planning lifecycle for one managed project without replacing ApexYard governance |
 | `/split-portfolio` | Migrate a single-fork adopter to split-portfolio mode (public framework + private portfolio) |
 | `/release` | (Framework-only) Cut an apexyard release — diff, bump, CHANGELOG, release PR, tag |
 | `/release-sync` | (Framework-only) Sync `main` back to `dev` after a squash-merge release so the squash commit is an ancestor of `dev`, preventing recurring merge conflicts |
 | `/projects` | List all managed projects from the registry with status |
-| `/inbox` | Items needing your attention — PRs, issues, comments, blockers |
+| `/inbox` | Items needing your attention — PRs, issues, comments, blockers, stale-ticket reconcile flags |
 | `/status` | Current snapshot — git, CI, in-progress work (use `--briefing` for 4-line shape) |
 | `/tasks` | Actionable task list across the portfolio with direct URLs, prioritised |
 | `/roadmap` | Update or create the product roadmap |
 | `/stakeholder-update` | Generate weekly / monthly / launch stakeholder updates |
 | `/fan-out` | Spawn N parallel agents in one message (per-task agent type, worktree isolation) |
 
-The hooks, agents, and skills are picked up automatically by Claude Code when this directory lives at the project root. The rules are imported via `@.claude/rules/*.md` from your project's `CLAUDE.md`.
+The hooks, agents, and skills are picked up automatically by Claude Code when this directory lives at the project root. Rule bodies stay on disk and are excluded from auto-load via `claudeMdExcludes` in `.claude/settings.local.json`. CLAUDE.md indexes them by name. Load a rule file when the work needs it.
 
 See `docs/getting-started.md` for the integration model — including how to install the `.claude/` layer alongside the rest of the stack.
 
@@ -309,10 +284,11 @@ Copy whichever you need into your project's `.github/workflows/`. Full details i
 | Rules (modular, framework-wide) | `.claude/rules/` |
 | **Adopter handbooks** (consumed by Rex during code review) | `handbooks/` — see [`handbooks/README.md`](handbooks/README.md) for the discovery + advisory/blocking conventions |
 | Agents | `.claude/agents/` |
-| Skills (64 slash commands) | `.claude/skills/` |
+| Skills (69 slash commands) | `.claude/skills/` |
 | Hook wiring | `.claude/settings.json` |
 | **Per-project docs** | `projects/<name>/` |
 | **Live working copies** (gitignored) | `workspace/<name>/` |
+| **Cognitive memory layer** (optional, docs-only scaffold) | `.claude/memory/` — see [`.claude/memory/README.md`](.claude/memory/README.md) for what it is, what it isn't, and how it differs from AgDRs / Claude Code's native session memory |
 | **Topology bundles** (harness templates per service shape) | `topologies/<name>/` — see [`topologies/README.md`](topologies/README.md) |
 | CI pipelines | `golden-paths/pipelines/` |
 | Getting Started | `docs/getting-started.md` |

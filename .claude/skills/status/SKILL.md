@@ -4,6 +4,8 @@ description: Project snapshot — git state, open PRs + CI, recent merges, in-pr
 allowed-tools: Bash, Read, Grep, Glob
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /status — Current Status Snapshot
 
 A focused "where am I" view. Where `/inbox` shows what's waiting on you and `/projects` shows portfolio health, `/status` shows the **current state of work**: branch, dirty files, recent commits, open PRs, and the in-progress issue.
@@ -222,7 +224,7 @@ Behaviour:
 | Field | Source |
 |-------|--------|
 | Active workspace | cwd: `<ops_root>/workspace/<name>/...` → `<name>`; `<ops_root>` exactly → `(ops)`; anywhere else → `(unknown)` |
-| Active ticket | `<ops_root>/.claude/session/tickets/<workspace>` first (only when workspace is a real name), then `<ops_root>/.claude/session/current-ticket`. Format: `#<number> — <title>`. No marker → `(none)` |
+| Active ticket | The marker of the working tree the cwd is in (`apexyard-ticket` in its git dir, resolved by `.claude/hooks/_lib-active-ticket.sh`). A cwd outside the ops fork and its registered clones has no marker. Format: `#<number> — <title>`. No marker → `(none)` |
 | Branch | `git branch --show-current`, run inside the inferred workspace dir (or cwd if no workspace). Detached HEAD or no git repo → `(no branch)` |
 | Role set | Active ticket's labels — first match against the canonical list (`backend`, `frontend`, `qa`, `security`, `platform`, `sre`, `data`, `ux`, `ui`, `product`, `tech-lead`, plus the `-engineer` / `-auditor` / `-designer` / `-manager` / `-lead` long forms). No match (or no ticket) → `<none — inferred per task>` |
 
@@ -252,7 +254,7 @@ ln -s "$(pwd)/bin/apexyard" ~/.local/bin/apexyard
 apexyard status
 ```
 
-The shim walks up from `$PWD` looking for the apexyard fork root (`onboarding.yaml` + `apexyard.projects.yaml`), then runs the same briefing helper. No PATH-shadowing of the `claude` binary, no recursion into Claude Code — pure `bash` end-to-end.
+The shim walks up from `$PWD` looking for the apexyard fork root — the `.apexyard-fork` marker (split-portfolio v2) OR the legacy `onboarding.yaml` + `apexyard.projects.yaml` pair (v1) — then runs the same briefing helper. No PATH-shadowing of the `claude` binary, no recursion into Claude Code — pure `bash` end-to-end.
 
 ## Rules
 

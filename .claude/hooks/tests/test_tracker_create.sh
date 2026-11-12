@@ -20,6 +20,11 @@
 # Exit 0 = all pass. Exit 1 on first failure.
 
 set -u
+
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
 unset APEXYARD_OPS_PIN_DIR CLAUDE_CODE_SESSION_ID 2>/dev/null || true
 
 HOOK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +32,7 @@ TRACKER_LIB="$HOOK_DIR/_lib-tracker.sh"
 CONFIG_LIB="$HOOK_DIR/_lib-read-config.sh"
 PORTFOLIO_LIB="$HOOK_DIR/_lib-portfolio-paths.sh"
 OPSROOT_LIB="$HOOK_DIR/_lib-ops-root.sh"
+RUNTIME_SCANNER="$HOOK_DIR/check-private-refs-runtime.sh"
 
 PASS=0
 FAIL=0
@@ -47,6 +53,8 @@ make_sandbox() {
   cp "$TRACKER_LIB"   "$sb/.claude/hooks/_lib-tracker.sh"
   cp "$CONFIG_LIB"    "$sb/.claude/hooks/_lib-read-config.sh"
   cp "$PORTFOLIO_LIB" "$sb/.claude/hooks/_lib-portfolio-paths.sh"
+  cp "$RUNTIME_SCANNER" "$sb/.claude/hooks/check-private-refs-runtime.sh"
+  chmod +x "$sb/.claude/hooks/check-private-refs-runtime.sh"
   [ -f "$OPSROOT_LIB" ] && cp "$OPSROOT_LIB" "$sb/.claude/hooks/_lib-ops-root.sh"
   cat > "$sb/.claude/project-config.defaults.json" <<'JSON'
 { "tracker": { "kind": "gh" } }
@@ -111,7 +119,54 @@ out=$(PATH="$SB/bin:$PATH" tracker_create "o/r" "Add login" "$BODY"); rc=$?
 assert_eq "tracker_create gh failure → non-zero exit" "1" "$rc"
 assert_eq "tracker_create gh failure → empty stdout"  ""  "$out"
 
+# #1327 — the CLI's own error text must reach stderr, not be discarded.
+# Without it every failure reads like an auth problem to the operator.
+cat > "$SB/bin/gh" <<'EOF'
+#!/bin/bash
+echo "could not add label: 'chore' not found" >&2
+exit 1
+EOF
+chmod +x "$SB/bin/gh"
+tracker_clear_cache
+out=$(PATH="$SB/bin:$PATH" tracker_create "o/r" "Add login" "$BODY" "chore" 2>"$SB/err"); rc=$?
+assert_eq "tracker_create gh failure → non-zero exit (stderr case)" "1" "$rc"
+assert_eq "tracker_create gh failure → stdout stays empty"          ""  "$out"
+assert_eq "tracker_create gh failure → gh error reaches stderr" "1" "$(grep -c "could not add label: 'chore' not found" "$SB/err")"
+
 rm -rf "$SB"
+
+# #1327 — same stderr contract for the glab and custom adapters. Both kinds
+# are set through project-config defaults, so no YAML parser is needed.
+SBE=$(make_sandbox)
+cat > "$SBE/bin/glab" <<'EOF'
+#!/bin/bash
+echo "glab: 403 Forbidden" >&2
+exit 1
+EOF
+chmod +x "$SBE/bin/glab"
+BODYE="$SBE/body.md"; printf 'body\n' > "$BODYE"
+for kind in glab custom; do
+  if [ "$kind" = "glab" ]; then
+    printf '{ "tracker": { "kind": "glab" } }\n' > "$SBE/.claude/project-config.defaults.json"
+    expect="glab: 403 Forbidden"
+  else
+    printf '%s\n' '{ "tracker": { "kind": "custom", "create_command": "echo \"custom: rejected\" >&2; false" } }' > "$SBE/.claude/project-config.defaults.json"
+    expect="custom: rejected"
+  fi
+  (
+    cd "$SBE" || exit 1
+    # shellcheck source=/dev/null
+    . "$SBE/.claude/hooks/_lib-tracker.sh"
+    tracker_clear_cache
+    out=$(PATH="$SBE/bin:$PATH" tracker_create "o/r" "t" "$BODYE" 2>"$SBE/err-$kind"); rc=$?
+    printf '%s|%s\n' "$rc" "$out"
+  ) > "$SBE/r-$kind"
+  IFS="|" read -r e_rc e_out < "$SBE/r-$kind"
+  assert_eq "tracker_create $kind failure → non-zero exit"           "1" "$e_rc"
+  assert_eq "tracker_create $kind failure → stdout stays empty"      ""  "$e_out"
+  assert_eq "tracker_create $kind failure → CLI error reaches stderr" "1" "$(grep -c "$expect" "$SBE/err-$kind")"
+done
+rm -rf "$SBE"
 
 # Shape-only contract — kind=none does not call a CLI; it returns 3 and emits
 # the body (if given) to stdout for manual/external filing. NOT a failure path.
@@ -175,6 +230,42 @@ else
   echo "SKIP: tracker_create glab per-project case (no yq / python3+PyYAML)"
 fi
 
+# Case 4b (#955) — glab prints the modern `/-/work_items/N` issue URL form.
+# _tracker_extract_ref_url must parse it (previously only matched /issues/N).
+if [ "$HAVE_YAML" = yes ]; then
+  SB2b=$(make_sandbox "version: 1
+projects:
+  - name: gl
+    repo: g/p
+    tracker:
+      kind: glab")
+  cat > "$SB2b/bin/glab" <<'EOF'
+#!/bin/bash
+if [ "$1" = "issue" ] && [ "$2" = "create" ]; then
+  echo "Creating issue in g/p..."
+  echo "https://gitlab.com/g/p/-/work_items/77"
+fi
+EOF
+  chmod +x "$SB2b/bin/glab"
+  printf 'glab body\n' > "$SB2b/body.md"
+  (
+    cd "$SB2b" || exit 1
+    # shellcheck source=/dev/null
+    . "$SB2b/.claude/hooks/_lib-tracker.sh"
+    tracker_clear_cache
+    out=$(PATH="$SB2b/bin:$PATH" tracker_create "g/p" "GL title" "$SB2b/body.md")
+    printf '%s\t%s\n' \
+      "$(printf '%s' "$out" | jq -r '.ref // empty' 2>/dev/null)" \
+      "$(printf '%s' "$out" | jq -r '.url // empty' 2>/dev/null)"
+  ) > "$SB2b/result"
+  IFS=$'\t' read -r r_ref r_url < "$SB2b/result"
+  assert_eq "tracker_create glab work_items → ref parsed"  "77" "$r_ref"
+  assert_eq "tracker_create glab work_items → url parsed"  "https://gitlab.com/g/p/-/work_items/77" "$r_url"
+  rm -rf "$SB2b"
+else
+  echo "SKIP: tracker_create glab work_items case (no yq / python3+PyYAML)"
+fi
+
 # Case 5 — per-project custom create_command. The title/body pass via ENV
 # ($TRACKER_TITLE / $TRACKER_BODY_FILE), never string-substituted — so a title
 # full of shell metacharacters cannot inject. (needs a YAML parser.)
@@ -212,6 +303,117 @@ EOF
   rm -rf "$SB3"
 else
   echo "SKIP: tracker_create custom per-project case (no yq / python3+PyYAML)"
+fi
+
+# ---------------------------------------------------------------------------
+# tracker_label_ensure (#709) — the tracker-agnostic analog of the inline
+# `gh label create` steps used by /spike, /prototype, /investigation.
+#
+# Contract: best-effort, ALWAYS exit 0. gh + glab do a real create; every other
+# kind (jira/linear/asana/custom/none) is a no-op. gh takes a BARE-hex colour
+# ("FBCA04"); glab normalises it to "#FBCA04".
+# ---------------------------------------------------------------------------
+
+# Case 6 — gh: `label create <name> --repo <repo>` with a BARE-hex colour.
+SBL=$(make_sandbox)
+cat > "$SBL/bin/gh" <<'EOF'
+#!/bin/bash
+[ -n "${GH_CAPTURE:-}" ] && printf '%s\n' "$@" > "$GH_CAPTURE"
+EOF
+chmod +x "$SBL/bin/gh"
+(
+  cd "$SBL" || exit 1
+  # shellcheck source=/dev/null
+  . "$SBL/.claude/hooks/_lib-tracker.sh"
+  tracker_clear_cache
+  PATH="$SBL/bin:$PATH" GH_CAPTURE="$SBL/cap" tracker_label_ensure "o/r" "spike" "FBCA04" "Throw-away exploration"
+  echo "rc=$?"
+) > "$SBL/rc"
+gh_cap="$SBL/cap"
+assert_eq "tracker_label_ensure gh → exit 0"                 "0"    "$(sed -n 's/^rc=//p' "$SBL/rc")"
+assert_eq "tracker_label_ensure gh → 'label create' subcmd"  "spike" "$(awk 'p{print;exit} /^create$/{p=1}' "$gh_cap")"
+assert_eq "tracker_label_ensure gh → --repo passed"          "o/r"  "$(awk 'p{print;exit} /^--repo$/{p=1}' "$gh_cap")"
+assert_eq "tracker_label_ensure gh → colour is BARE hex (no #)" "FBCA04" "$(awk 'p{print;exit} /^--color$/{p=1}' "$gh_cap")"
+
+# A gh that errors (e.g. duplicate label) must STILL leave tracker_label_ensure at exit 0.
+cat > "$SBL/bin/gh" <<'EOF'
+#!/bin/bash
+exit 22
+EOF
+chmod +x "$SBL/bin/gh"
+(
+  cd "$SBL" || exit 1
+  # shellcheck source=/dev/null
+  . "$SBL/.claude/hooks/_lib-tracker.sh"; tracker_clear_cache
+  PATH="$SBL/bin:$PATH" tracker_label_ensure "o/r" "spike" "FBCA04" "d"; echo "rc=$?"
+) > "$SBL/rc2"
+assert_eq "tracker_label_ensure gh error (dup) → still exit 0" "0" "$(sed -n 's/^rc=//p' "$SBL/rc2")"
+
+# Empty repo / name → no-op, exit 0, no CLI call.
+(
+  cd "$SBL" || exit 1
+  # shellcheck source=/dev/null
+  . "$SBL/.claude/hooks/_lib-tracker.sh"; tracker_clear_cache
+  tracker_label_ensure "" "spike"; echo "rc_norepo=$?"
+  tracker_label_ensure "o/r" "";     echo "rc_noname=$?"
+) > "$SBL/rc3"
+assert_eq "tracker_label_ensure empty repo → exit 0 (no-op)" "0" "$(sed -n 's/^rc_norepo=//p' "$SBL/rc3")"
+assert_eq "tracker_label_ensure empty name → exit 0 (no-op)" "0" "$(sed -n 's/^rc_noname=//p' "$SBL/rc3")"
+rm -rf "$SBL"
+
+# Case 7 — glab: `label create --name <name> -R <repo>` with a #-prefixed colour.
+if [ "$HAVE_YAML" = yes ]; then
+  SBLG=$(make_sandbox "version: 1
+projects:
+  - name: gl
+    repo: g/p
+    tracker:
+      kind: glab")
+  cat > "$SBLG/bin/glab" <<'EOF'
+#!/bin/bash
+[ -n "${GLAB_CAPTURE:-}" ] && printf '%s\n' "$@" > "$GLAB_CAPTURE"
+EOF
+  chmod +x "$SBLG/bin/glab"
+  (
+    cd "$SBLG" || exit 1
+    # shellcheck source=/dev/null
+    . "$SBLG/.claude/hooks/_lib-tracker.sh"; tracker_clear_cache
+    PATH="$SBLG/bin:$PATH" GLAB_CAPTURE="$SBLG/cap" tracker_label_ensure "g/p" "spike" "FBCA04" "d"; echo "rc=$?"
+  ) > "$SBLG/rc"
+  glab_cap="$SBLG/cap"
+  assert_eq "tracker_label_ensure glab → exit 0"                  "0"      "$(sed -n 's/^rc=//p' "$SBLG/rc")"
+  assert_eq "tracker_label_ensure glab → --name passed"           "spike"  "$(awk 'p{print;exit} /^--name$/{p=1}' "$glab_cap")"
+  assert_eq "tracker_label_ensure glab → -R (repo) passed"        "g/p"    "$(awk 'p{print;exit} /^-R$/{p=1}' "$glab_cap")"
+  assert_eq "tracker_label_ensure glab → colour normalised to #hex" "#FBCA04" "$(awk 'p{print;exit} /^--color$/{p=1}' "$glab_cap")"
+  rm -rf "$SBLG"
+
+  # Case 8 — a non-gh/glab tracker (jira) → no-op, exit 0, NO CLI on PATH is called.
+  SBLJ=$(make_sandbox "version: 1
+projects:
+  - name: jr
+    repo: j/r
+    tracker:
+      kind: jira")
+  # Put a booby-trapped gh/glab on PATH; a no-op must not invoke either.
+  for c in gh glab; do
+    cat > "$SBLJ/bin/$c" <<EOF
+#!/bin/bash
+touch "$SBLJ/CALLED_$c"
+EOF
+    chmod +x "$SBLJ/bin/$c"
+  done
+  (
+    cd "$SBLJ" || exit 1
+    # shellcheck source=/dev/null
+    . "$SBLJ/.claude/hooks/_lib-tracker.sh"; tracker_clear_cache
+    PATH="$SBLJ/bin:$PATH" tracker_label_ensure "j/r" "spike" "FBCA04" "d"; echo "rc=$?"
+  ) > "$SBLJ/rc"
+  called=no; { [ -e "$SBLJ/CALLED_gh" ] || [ -e "$SBLJ/CALLED_glab" ]; } && called=yes
+  assert_eq "tracker_label_ensure jira → exit 0 (no-op)"        "0"  "$(sed -n 's/^rc=//p' "$SBLJ/rc")"
+  assert_eq "tracker_label_ensure jira → no gh/glab invoked"    "no" "$called"
+  rm -rf "$SBLJ"
+else
+  echo "SKIP: tracker_label_ensure glab + jira per-project cases (no yq / python3+PyYAML)"
 fi
 
 echo "=========================================="

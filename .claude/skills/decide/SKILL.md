@@ -1,9 +1,11 @@
 ---
 name: decide
 description: Make a technical decision with structured reasoning and create an Agent Decision Record (AgDR).
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: "<what you're deciding>"
 ---
+
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
 
 # /decide — Technical Decision Gate
 
@@ -54,6 +56,8 @@ State the chosen option with justification.
 
 Create file at `{project-root}/docs/agdr/AgDR-{NNNN}-{slug}.md`.
 
+After writing the file, source `.claude/hooks/_lib-review-markers.sh` from the ops fork and run `review_validate_body agdr <path-to-new-AgDR>`. Repair any missing title or required section before reporting the decision. This local check does not approve the decision or write a review marker.
+
 **Important**: AgDRs live in the **current project's repository**, not centralised. Each project has its own `docs/agdr/` folder and its own ID sequence.
 
 Resolve the AgDR template via the portfolio helper so adopter overrides win when present:
@@ -103,10 +107,34 @@ Chosen: **{option}**, because {justification}.
 
 ### 6. Get the Next ID
 
+Use a filesystem lock while scanning and reserving the next ID. This prevents
+two concurrent `/decide` runs from selecting the same number.
+
 ```bash
-ls docs/agdr/AgDR-*.md 2>/dev/null | sort -V | tail -1 | grep -oE 'AgDR-[0-9]+' | grep -oE '[0-9]+'
-# Increment by 1, or start at 0001
+# Use the main worktree's shared Git directory so linked worktrees serialize
+# allocation together.
+git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+ops_root=$(dirname "$git_common_dir")
+lock_dir="${APEXYARD_AGDR_LOCK_DIR:-$ops_root/.claude/session}/agdr-id.lock"
+while ! mkdir "$lock_dir" 2>/dev/null; do sleep 1; done
+trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+reservation_dir="${APEXYARD_AGDR_RESERVATION_DIR:-$ops_root/.claude/session/agdr-reservations}"
+mkdir -p "$reservation_dir"
+last=$(find docs/agdr "$reservation_dir" -maxdepth 1 -type f \( \
+    -name 'AgDR-[0-9][0-9][0-9][0-9]-*.md' -o -name 'AgDR-[0-9][0-9][0-9][0-9]' \) -print \
+  | sed -E 's#^.*/AgDR-([0-9]{4})(-.*)?$#\1#' | sort -n | tail -1)
+next=$(printf '%04d' $((10#${last:-0} + 1)))
+# Reserve the ID before writing the record. The reservation is shared by all
+# linked worktrees and remains after a worktree is removed.
+while ! (set -C; : > "$reservation_dir/AgDR-${next}") 2>/dev/null; do
+  next=$(printf '%04d' $((10#$next + 1)))
+done
+# Keep the reservation until the AgDR file is committed.
 ```
+
+Keep the lock until the AgDR file is created. If the candidate exists after
+the scan, increment and check again. Do not delete a reservation after the
+AgDR is written; it prevents another branch from reusing the identifier.
 
 ### 7. Offer a Contrarian challenge (optional — opt-in, never forced)
 

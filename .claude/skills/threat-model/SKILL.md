@@ -8,6 +8,10 @@ effort: high
 
 # /threat-model — STRIDE Threat Modelling
 
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the
+threat model and its findings: lead with the outcome, preserve uncertainty, and
+remove empty sections.
+
 Deep-dive security analysis using the STRIDE framework. Produces a prioritized threat catalogue with mitigations. This is the expert companion to `/launch-check`'s security row — invoke it when security shows WARN or FAIL, or proactively before any launch.
 
 **Consumes the DFD produced by [`/dfd`](../dfd/SKILL.md).** The Data Flow Diagram at `projects/<project>/architecture/dfd.md` is the source of truth; this skill iterates its trust-boundary crossings rather than rebuilding its own data-flow view. If the DFD doesn't exist, this skill OFFERS to run `/dfd` first (see Step 1). See AgDR-0026 for the single-source-of-truth rationale.
@@ -104,11 +108,15 @@ The DFD's structured elements feed Step 2:
 The threat-model audit output will inline three sections from `dfd.md` so the artefact is self-contained. Extract them now into separate variables so they can be embedded in the Step 5b body:
 
 ```bash
-# Extract the ```mermaid ... ``` fenced block under `## Diagram`
+# Extract the Mermaid source from the fenced block under `## Diagram`.
+# Print only the lines inside the fence. Step 5b adds its own fence.
+# Do not copy the DFD's fence lines or the prose around the diagram.
 dfd_mermaid=$(awk '
-  /^## Diagram/        { in_diagram = 1; next }
-  /^## /               { if (in_diagram) exit }
-  in_diagram           { print }
+  /^## Diagram/                            { in_diagram = 1; next }
+  in_diagram && /^## /                     { exit }
+  in_diagram && /^```mermaid[[:space:]]*$/ { in_fence = 1; next }
+  in_fence && /^```[[:space:]]*$/          { exit }
+  in_fence                                 { print }
 ' "$dfd")
 
 # Extract the `## Trust boundaries` section (heading + body, up to next `## `)
@@ -125,13 +133,19 @@ dfd_classifications=$(awk '
   capture                    { print }
 ' "$dfd")
 
+# Warn when a section extracts to nothing, and name the heading tried. A DFD
+# may classify no data, so this warns and continues. It does not stop.
+[ -n "$dfd_mermaid" ] || echo "WARNING: $dfd has no content for the Mermaid block under ## Diagram. The audit snapshot will omit it." >&2
+[ -n "$dfd_trust" ] || echo "WARNING: $dfd has no content for the ## Trust boundaries section. The audit snapshot will omit it." >&2
+[ -n "$dfd_classifications" ] || echo "WARNING: $dfd has no content for the ## Data classifications section. The audit snapshot will omit it." >&2
+
 # Discovery provenance is intentionally NOT extracted — too noisy for an
 # audit snapshot. Readers click through to the live DFD for that.
 
 dfd_captured_at=$(date -u +"%Y-%m-%d")
 ```
 
-These three blocks become the `## DFD (snapshot as of YYYY-MM-DD)` section at the top of the audit body in Step 5b.
+These three blocks become the `## DFD (snapshot as of YYYY-MM-DD)` section at the top of the audit body in Step 5b. If a block is empty, Step 1b prints a warning that names the heading it tried. Report that warning to the operator.
 
 ### Step 2: Apply STRIDE to each entry point
 
@@ -231,7 +245,8 @@ body=$(mktemp); cat > "$body" <<EOF
 > snapshot the DFD as-it-was-then, not as-it-is-now.
 
 \`\`\`mermaid
-${dfd_mermaid}\`\`\`
+${dfd_mermaid}
+\`\`\`
 
 ${dfd_trust}
 
@@ -407,7 +422,7 @@ The lib re-evaluates the marker on every persist; the operator can toggle freely
 
 - **Don't link to the live DFD.** Inline copy at audit time. The whole point of the snapshot is that the threat model survives later DFD edits without rotting.
 - **Don't fall back to "inline discovery" when the DFD is missing.** That was the pre-#270 behaviour; it produced low-quality artefacts that couldn't be re-validated later. Refuse instead.
-- **Don't extract from `dfd.md` programmatically beyond the three sections named in Step 1b.** The contract is: Mermaid block + trust boundaries + classifications. Adding more (e.g. provenance) bloats the artefact; adding less breaks the audit's self-containment.
+- **Don't extract from `dfd.md` programmatically beyond the three sections named in Step 1b.** The contract is the three exact headings `## Diagram` (Mermaid block), `## Trust boundaries` (table), and `## Data classifications` (table) — both `templates/architecture/dfd.md` and `.claude/skills/dfd/generate-mermaid.sh` MUST emit these verbatim (see the heading-contract rule in `.claude/skills/dfd/SKILL.md`). Adding more (e.g. provenance) bloats the artefact; adding less, or renaming a heading, breaks the audit's self-containment and silently zeroes out the matching `dfd_*` variable in Step 1b.
 - **Don't skip the Mermaid lint after persistence.** If the live DFD has broken Mermaid, the snapshot inherits it. Surfacing that here is cheaper than discovering it on GitHub.
 
 ---

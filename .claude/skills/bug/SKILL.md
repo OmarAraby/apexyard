@@ -7,6 +7,8 @@ allowed-tools: Bash, Read, Write
 
 # /bug — Create a Bug Report Ticket
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 Creates a structured GitHub Issue for a bug with Given/When/Then scenario, repro steps, environment, and severity. Asks guided questions, shows the formatted ticket for confirmation, then creates the issue.
 
 ## Path resolution
@@ -36,32 +38,29 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 Before any `gh issue create` (or other tracker CLI), write this skill's name to the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the command through. At skill entry:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "bug" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "bug" > "$skill_marker"
 ```
 
 Remove the marker on **every** exit path (success, early-exit, user cancel, error):
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers from killed sessions, but a clean exit should never leave one behind. See AgDR-0030.
+The `clear-issue-skill-marker.sh` SessionStart hook clears only the current session's marker, but a clean exit should never leave one behind. See AgDR-0030.
 
 ### 1. Resolve the target repo
 
-Read `.claude/session/current-ticket` to determine which repo we're working in. If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
+Read the active-ticket marker of the working tree you are in to determine which repo we're working in. The marker is the `apexyard-ticket` file in the git dir of that tree. See `/start-ticket` "Read the active ticket". If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
 
 ```
 Which project is this bug in?
@@ -108,10 +107,10 @@ How severe is this?
 3. P2 — minor, fix when convenient
 ```
 
-**d) Environment (optional)**
+**d) Environment details**
 
 ```
-Any environment details? (browser, device, staging/prod, or Enter to skip)
+Any environment details? (browser, device, staging/prod, or enter TBD if unknown)
 ```
 
 **e) Investigation Notes (optional)**
@@ -133,6 +132,8 @@ template=$(portfolio_resolve_template tickets/bug.md)   # → custom-templates/t
 Single-fork adopters (no `portfolio` block) and adopters with no override fall straight through to `templates/tickets/bug.md`. Adopters who want a customised bug-body shape drop their version at `<private_repo>/custom-templates/tickets/bug.md`. See `templates/README.md` for the path-mirroring convention.
 
 **Backward-compat fallback**: if `portfolio_resolve_template` returns empty (template file missing — partial adopter setup), fall back to the inline heredoc body below and print a one-line WARN on stderr (`WARN: tickets/bug.md template missing — using inline fallback`). This preserves the pre-refactor behaviour for adopters whose installations don't yet have the new template files.
+
+Read `.claude/rules/writing-standard.md` before drafting. Treat the resolved template as the source of truth. Keep required sections, write `TBD` for unknown required values, remove empty conditional sections, and delete the guidance comment before filing.
 
 ### 5. Show the formatted ticket for confirmation
 
@@ -156,16 +157,16 @@ Here's the ticket I'll create:
 3. ...
 
 ## Environment
-{environment or "Not specified"}
+{environment details or TBD}
 
 ## Severity
 {P0-critical / P1-important / P2-later}
 
 ## Mitigation
-{workaround or "—"}
+{include only when provided}
 
 ## Investigation Notes
-{notes or "—"}
+{include only when provided}
 
 ## Glossary
 | Term | Definition |

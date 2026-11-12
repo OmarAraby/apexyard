@@ -5,6 +5,8 @@ argument-hint: "<feature-slug> [project-name] [--force]"
 allowed-tools: Bash, Read, Grep, Glob, Write, Edit
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /feature-diagram — Per-feature Mermaid Sub-graph
 
 Reads the Feature Inventory at `projects/<name>/feature-inventory.md` (produced by `/extract-features`) and writes a per-feature Mermaid `flowchart LR` showing the **HTTP routes, data models, async jobs, and UI screens** that participate in one feature. Output: `projects/<name>/features/<slug>.md` (one file per feature).
@@ -50,7 +52,7 @@ The Path resolution section's example sources the helper *once* for documentatio
 
 ```
 /feature-diagram create-order                       # current project (cwd inside workspace/<name>/ or single-project fork)
-/feature-diagram create-order curios-dog            # registered project
+/feature-diagram create-order sample-app            # registered project
 /feature-diagram reset-password --force             # overwrite existing diagram
 ```
 

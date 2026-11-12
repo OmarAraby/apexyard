@@ -23,13 +23,19 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/validate-branch-name.sh"
 LIB_SRC="$SRC_ROOT/.claude/hooks/_lib-extract-push-ref.sh"
+LIB_STRIP_HEREDOC_SRC="$SRC_ROOT/.claude/hooks/_lib-strip-heredoc.sh"
 LIB_CONFIG_SRC="$SRC_ROOT/.claude/hooks/_lib-read-config.sh"
 LIB_PR_REPO_SRC="$SRC_ROOT/.claude/hooks/_lib-pr-repo.sh"
 
-for f in "$HOOK_SRC" "$LIB_SRC"; do
+for f in "$HOOK_SRC" "$LIB_SRC" "$LIB_STRIP_HEREDOC_SRC"; do
   if [ ! -f "$f" ]; then
     echo "FAIL: required source missing: $f" >&2
     exit 1
@@ -60,7 +66,12 @@ make_sandbox_with_wrong_local_branch() {
   )
   mkdir -p "$sb/.claude/hooks"
   cp "$HOOK_SRC" "$sb/.claude/hooks/validate-branch-name.sh"
+  cp "$SRC_ROOT/.claude/hooks/_lib-git-global.sh" "$sb/.claude/hooks/"
+  cp "$SRC_ROOT/.claude/hooks/_lib-awk-fallback.sh" "$sb/.claude/hooks/"
   cp "$LIB_SRC"  "$sb/.claude/hooks/_lib-extract-push-ref.sh"
+  if [ -f "$LIB_STRIP_HEREDOC_SRC" ]; then
+    cp "$LIB_STRIP_HEREDOC_SRC" "$sb/.claude/hooks/_lib-strip-heredoc.sh"
+  fi
   if [ -f "$LIB_CONFIG_SRC" ]; then
     cp "$LIB_CONFIG_SRC" "$sb/.claude/hooks/_lib-read-config.sh"
   fi
@@ -127,6 +138,15 @@ run_case "main is exempt as trunk" \
 
 run_case "dev is exempt as trunk (release-cut model)" \
   "git push origin dev" 0
+
+# ---- #888: 'development' (gitflow long form) trunk exemption -----------
+#
+# Bug: the original hardcoded exact-name list (main|master|develop|dev)
+# missed `development`, the long form used as the integration branch by
+# many Bitbucket/gitflow remotes — a legitimate mirror push to that branch
+# was wrongly blocked as a malformed feature branch.
+run_case "#888: development is exempt as trunk (gitflow long form)" \
+  "git push origin development" 0
 
 # Non-conforming push refs → block (the push-ref is now the source of truth).
 run_case "explicit ref: bogus-branch blocks" \
@@ -284,6 +304,114 @@ run_case "#693: no-cd explicit non-conforming ref still blocks" \
   "git push origin bogus-branch" 2
 run_case "#693: no-cd no-ref falls back to host HEAD (bogus) → blocks" \
   "git push origin" 2
+
+# ---- #888: config-driven trunk whitelist --------------------------------
+#
+# .branch.trunk_whitelist in .claude/project-config.json is config-driven,
+# mirroring .branch.type_whitelist. A project can add a client-mandated
+# trunk name (e.g. `trunk`) without another upstream PR per name. A real
+# malformed feature branch must still block even with the override present.
+
+# Like make_sandbox_with_wrong_local_branch, but also drops a
+# .claude/project-config.json overriding .branch.trunk_whitelist so the
+# custom name is exempt. Since config_get shallow-merges at the top-level
+# key, this override's "branch" object replaces the defaults' "branch"
+# object wholesale — type_whitelist then falls back to the hook's hardcoded
+# TYPES default, which still contains "feature"/"fix" so the ticket-shape
+# assertions below are unaffected.
+make_sandbox_with_custom_trunk() {
+  local sb
+  sb=$(make_sandbox_with_wrong_local_branch)
+  cat > "$sb/.claude/project-config.json" <<'JSON'
+{
+  "branch": {
+    "trunk_whitelist": ["main", "master", "develop", "dev", "development", "trunk"]
+  }
+}
+JSON
+  echo "$sb"
+}
+
+run_custom_trunk_case() {
+  local label="$1" cmd="$2" want_rc="$3"
+  local sb; sb=$(make_sandbox_with_custom_trunk)
+  local input
+  input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
+  local got_rc got_stderr
+  got_stderr=$(cd "$sb" && echo "$input" | bash .claude/hooks/validate-branch-name.sh 2>&1 >/dev/null)
+  got_rc=$?
+  rm -rf "$sb"
+
+  if [ "$got_rc" != "$want_rc" ]; then
+    echo "FAIL [$label]: want rc=$want_rc, got $got_rc" >&2
+    echo "    cmd: $cmd" >&2
+    echo "    stderr: ${got_stderr:0:300}" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+    return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+
+run_custom_trunk_case "#888: config-added custom trunk 'trunk' is exempt" \
+  "git push origin trunk" 0
+
+run_custom_trunk_case "#888: 'development' still exempt via config override (explicitly listed)" \
+  "git push origin development" 0
+
+run_custom_trunk_case "#888: real malformed feature branch still blocks with trunk override present" \
+  "git push origin feature/no-ticket-id" 2
+
+run_custom_trunk_case "#888: bogus branch still blocks with trunk override present" \
+  "git push origin bogus-branch" 2
+
+# ---- #1362: dependency-bot branch prefixes ------------------------------
+#
+# Bots name their own branches and have no ticket to reference, so a
+# maintainer could never push the changelog fragment the merge gates demand.
+# CI already exempts these prefixes (pr-title-check.yml, #588). The negatives
+# below pin the exemption to an ANCHORED prefix: a name that merely contains
+# the word, or nests it under another path, must still block.
+
+run_case "#1362: dependabot/ branch is exempt" \
+  "git push origin dependabot/npm_and_yarn/undici-8.9.0" 0
+
+run_case "#1362: renovate/ branch is exempt" \
+  "git push origin renovate/major-node-types" 0
+
+run_case "#1362: nested feature/dependabot/ still blocks" \
+  "git push origin feature/dependabot/bump-undici" 2
+
+run_case "#1362: dependabot-manual/ lookalike still blocks" \
+  "git push origin dependabot-manual/bump-undici" 2
+
+run_case "#1362: branch merely containing 'dependabot' still blocks" \
+  "git push origin chore/update-dependabot-config" 2
+
+run_case "#1362: renovate-bot/ lookalike still blocks" \
+  "git push origin renovate-bot/bump-node" 2
+
+# Near-miss shapes. Each differs from an exempt prefix by one character or by
+# position, so each is the mistake a future edit to the anchor would make.
+run_case "#1362: dependabotx/ lookalike still blocks" \
+  "git push origin dependabotx/foo" 2
+
+run_case "#1362: renovate-fix (no slash) still blocks" \
+  "git push origin renovate-fix" 2
+
+run_case "#1362: dependabot as a mid-path segment still blocks" \
+  "git push origin feature/dependabot-x" 2
+
+run_case "#1362: capitalised Dependabot/ still blocks" \
+  "git push origin Dependabot/npm/x" 2
+
+# An empty first segment is not exempt. Git rejects a ref ending in "/", so the
+# practical risk is low, but the anchor should not accept a name no bot emits.
+run_case "#1362: bare dependabot/ is not exempt" \
+  "git push origin dependabot/" 2
+
+run_case "#1362: bare renovate/ is not exempt" \
+  "git push origin renovate/" 2
 
 # ---- Summary ------------------------------------------------------------
 

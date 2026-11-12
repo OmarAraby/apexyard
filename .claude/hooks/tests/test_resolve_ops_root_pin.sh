@@ -24,6 +24,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 LIB="$SRC_ROOT/.claude/hooks/_lib-ops-root.sh"
 HOOK="$SRC_ROOT/.claude/hooks/pin-ops-root.sh"
@@ -57,7 +62,7 @@ run_case() {
 # Legacy v1 sandbox: onboarding.yaml + apexyard.projects.yaml.
 build_v1_sandbox() {
   local sb="$1"
-  mkdir -p "$sb/workspace/demo/.git"
+  mkdir -p "$sb/workspace/demo/.git" "$sb/.claude/hooks"
   : > "$sb/onboarding.yaml"
   : > "$sb/apexyard.projects.yaml"
 }
@@ -65,7 +70,7 @@ build_v1_sandbox() {
 # v2 sandbox: .apexyard-fork marker.
 build_v2_sandbox() {
   local sb="$1"
-  mkdir -p "$sb/workspace/demo/.git"
+  mkdir -p "$sb/workspace/demo/.git" "$sb/.claude/hooks"
   : > "$sb/.apexyard-fork"
 }
 
@@ -255,7 +260,7 @@ case_7() {
     # Run the hook from inside the ops fork. The hook resolves $PWD via
     # walk-up and writes the pin.
     cd "$sb/workspace/demo" || exit 1
-    bash "$HOOK" >/dev/null 2>&1
+    bash "$HOOK" <<<'{"source":"startup"}' >/dev/null 2>&1
   )
 
   local pin_file="$pin_dir/ops-root-$sess"
@@ -285,7 +290,7 @@ case_8() {
     unset CLAUDE_CODE_SESSION_ID
     export APEXYARD_OPS_PIN_DIR="$pin_dir"
     cd "$sb" || exit 1
-    bash "$HOOK" >/dev/null 2>&1
+    bash "$HOOK" <<<'{"source":"startup"}' >/dev/null 2>&1
   )
 
   # Pin dir should still be empty (no file created).
@@ -296,8 +301,121 @@ case_8() {
   mark_pass "$case_name"
 }
 
+# Case 9: nested and out-of-tree linked worktrees resolve to the main root.
+case_9() {
+  local case_name="linked worktrees: nested and out-of-tree resolve to main root"
+  local sb nested outside expected
+  sb=$(mktemp -d)
+  nested="$sb/.claude/worktrees/nested"
+  outside=$(mktemp -d)/linked
+  mkdir -p "$sb/.claude/worktrees"
+  git -C "$sb" init -q
+  : > "$sb/.apexyard-fork"
+  git -C "$sb" add .apexyard-fork
+  git -C "$sb" -c user.email=test@example.invalid -c user.name=test commit -qm init
+  expected=$(git -C "$sb" rev-parse --show-toplevel)
+  git -C "$sb" worktree add -q -b nested "$nested"
+  git -C "$sb" worktree add -q -b outside "$outside"
+  (
+    unset CLAUDE_CODE_SESSION_ID APEXYARD_OPS_DISABLE_PIN
+    # shellcheck source=/dev/null
+    . "$LIB"
+    [ "$(cd "$nested" && resolve_ops_root_walk)" = "$expected" ] || return 1
+    [ "$(cd "$outside" && resolve_ops_root_walk)" = "$expected" ] || return 1
+    pin_dir=$(mktemp -d)
+    printf '%s\n' "$nested" > "$pin_dir/ops-root-linked"
+    export CLAUDE_CODE_SESSION_ID=linked
+    export APEXYARD_OPS_PIN_DIR="$pin_dir"
+    [ "$(cd "$nested" && resolve_ops_root)" = "$expected" ] || return 1
+  )
+  if [ "$?" -ne 0 ]; then
+    mark_fail "$case_name" "linked worktree did not normalize to '$expected'"
+    return
+  fi
+  mark_pass "$case_name"
+}
+
+# Case 10: a pinned subdirectory fork must remain distinct from its enclosing
+# repository, while a unique v2 child still wins over a v1-pair sibling.
+case_10() {
+  local case_name="subdirectory fork pin: preserves fork root beside v1 sibling"
+  local outer fork portfolio pin_dir expected
+  outer=$(mktemp -d)
+  fork="$outer/fork"
+  portfolio="$outer/portfolio"
+  mkdir -p "$fork/.claude/hooks" "$portfolio"
+  git init -q "$outer"
+  : > "$fork/.apexyard-fork"
+  : > "$portfolio/onboarding.yaml"
+  : > "$portfolio/apexyard.projects.yaml"
+  pin_dir=$(mktemp -d)
+  expected=$(cd "$fork" && pwd -P)
+  printf '%s\n' "$expected" > "$pin_dir/ops-root-testsess10"
+  (
+    export CLAUDE_CODE_SESSION_ID="testsess10"
+    export APEXYARD_OPS_PIN_DIR="$pin_dir"
+    unset APEXYARD_OPS_DISABLE_PIN
+    # shellcheck source=/dev/null
+    . "$LIB"
+    out=$(cd "$fork" && resolve_ops_root)
+    [ "$out" = "$expected" ] || { mark_fail "$case_name (pin read)" "expected '$expected', got '$out'"; return; }
+    unset CLAUDE_CODE_SESSION_ID
+    cd "$fork" || return 1
+    export CLAUDE_CODE_SESSION_ID="testsess10-write"
+    bash "$HOOK" <<<'{"source":"startup"}' >/dev/null 2>&1
+    pinned=""
+    IFS= read -r pinned < "$pin_dir/ops-root-testsess10-write" || pinned=""
+    [ "$pinned" = "$expected" ] || { mark_fail "$case_name (pin write)" "expected '$expected', got '$pinned'"; return; }
+    mark_pass "$case_name"
+  )
+}
+
+# Case 11: a pinned split-portfolio sibling has the v1 pair but no hooks.
+# The pin is rejected and the unique v2 fork is selected. The SessionStart
+# writer must make the same choice when launched from the sibling workspace.
+case_11() {
+  local case_name="split portfolio pin: v2 fork wins over hookless v1 sibling"
+  local outer fork portfolio pin_dir expected
+  outer=$(mktemp -d)
+  fork="$outer/fork"
+  portfolio="$outer/portfolio"
+  mkdir -p "$fork/.claude/hooks" "$portfolio/workspace/demo"
+  git init -q "$outer"
+  : > "$fork/.apexyard-fork"
+  : > "$portfolio/onboarding.yaml"
+  : > "$portfolio/apexyard.projects.yaml"
+  pin_dir=$(mktemp -d)
+  expected=$(cd "$fork" && pwd -P)
+
+  # A stale pre-fix pin incorrectly names the portfolio sibling.
+  printf '%s\n' "$portfolio" > "$pin_dir/ops-root-testsess11-read"
+  (
+    export CLAUDE_CODE_SESSION_ID="testsess11-read"
+    export APEXYARD_OPS_PIN_DIR="$pin_dir"
+    unset APEXYARD_OPS_DISABLE_PIN
+    # shellcheck source=/dev/null
+    . "$LIB"
+    out=$(cd "$portfolio/workspace/demo" && resolve_ops_root)
+    [ "$out" = "$expected" ] \
+      || { mark_fail "$case_name (pin read)" "expected '$expected', got '$out'"; return; }
+  ) || return 1
+
+  # A fresh SessionStart pin from the same cwd must also name the fork.
+  (
+    export CLAUDE_CODE_SESSION_ID="testsess11-write"
+    export APEXYARD_OPS_PIN_DIR="$pin_dir"
+    cd "$portfolio/workspace/demo" || return 1
+    bash "$HOOK" <<<'{"source":"startup"}' >/dev/null 2>&1
+  ) || { mark_fail "$case_name (pin write)" "hook invocation failed"; return; }
+  local pinned=""
+  IFS= read -r pinned < "$pin_dir/ops-root-testsess11-write" || pinned=""
+  [ "$pinned" = "$expected" ] \
+    || { mark_fail "$case_name (pin write)" "expected '$expected', got '$pinned'"; return; }
+  mark_pass "$case_name"
+}
+
 echo "Running pin-first resolve_ops_root tests..."
-for fn in case_1 case_2 case_3 case_4 case_5 case_6 case_7 case_8; do
+for fn in case_1 case_2 case_3 case_4 case_5 case_6 case_7 case_8 case_9 case_10 case_11; do
   run_case "$fn"
 done
 

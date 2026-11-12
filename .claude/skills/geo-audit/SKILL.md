@@ -6,6 +6,8 @@ argument-hint: "[project-path]"
 effort: medium
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /geo-audit — LLM/Agent Discoverability Audit
 
 Deep-dive audit against the emerging GEO + AEO conventions. Checks discovery files (`llms.txt`, `AGENTS.md`), AI-crawler directives in `robots.txt`, capability manifests, citation-friendly metadata, snippet-extractable content shape, and token economics. Invoke when `/launch-check` flags the generative-engine row, or directly during docs/landing-site work.

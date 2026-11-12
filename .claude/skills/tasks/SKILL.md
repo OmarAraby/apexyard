@@ -4,6 +4,8 @@ description: Flat actionable task list across the portfolio with direct URLs —
 allowed-tools: Bash, Read, Grep, Glob
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /tasks — Actionable Task List
 
 A single ordered list of "things to click on right now". Where `/inbox` groups items by category, `/tasks` flattens everything into a prioritised TODO with one URL per line. Optimised for "I have 30 minutes, what should I do?".
@@ -15,10 +17,58 @@ Read the registry path via `portfolio_registry`, the per-project docs dir via `p
 ```bash
 source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-read-config.sh"
 source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-portfolio-paths.sh"
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-tracker.sh"
 registry=$(portfolio_registry)
 ```
 
 Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projects`, `./projects/ideas-backlog.md`). Adopters in split-portfolio mode override the `portfolio.{registry, projects_dir, ideas_backlog}` keys in `.claude/project-config.json`. Don't hardcode literal `apexyard.projects.yaml` or `projects/` paths in bash blocks — the helper resolves whichever mode the adopter is in. See `docs/multi-project.md`.
+
+## Tracker-agnostic issue listing (#710 / AgDR-0093)
+
+The **issue** sources below call `tracker_list` from `_lib-tracker.sh` (per `repo:` from the registry) instead of hardcoding `gh issue list`, so `/tasks` works on GitLab-tracked projects too:
+
+```bash
+# tracker_list <owner/repo> [state=…] [assignee=@me|none|<user>] [author=…] [labels=csv] [search=…] [since=ISO] [limit=N]
+# → JSON array [{ref,number,state,title,url,labels,updatedAt}, …]  ([] on empty/unavailable)
+```
+
+**Check that each read was complete (#1441).** A call that fills its limit may be a short read, and
+a failed call prints `[]`. Use `tracker_list_to`, which returns the verdict on stdout:
+
+```bash
+tmp=$(mktemp) || return 1
+status=$(tracker_list_to "$tmp" "$repo" assignee=@me labels=priority-high limit=50 2>/dev/null); rc=$?
+if [ "$status" = "TRUNCATED" ]; then                 # raise the limit and read again
+  status=$(tracker_list_to "$tmp" "$repo" assignee=@me labels=priority-high limit=200 2>/dev/null); rc=$?
+fi
+case "$status" in
+  UNKNOWN)
+    if [ "$rc" -ne 0 ]; then
+      echo "$repo: could not read issues"            # a failure, never print 0
+    else
+      echo "$repo: read $(jq -r 'length' < "$tmp"), completeness unknown"
+    fi ;;
+  TRUNCATED) echo "$repo: at least $(jq -r 'length' < "$tmp"), still not the end" ;;
+esac
+items=$(cat "$tmp"); rm -f "$tmp"
+```
+
+One retry is enough for a task list. A second `TRUNCATED` means the project has more matching
+issues than any one screen should show, so say "at least N" rather than reading further. A `glab`
+project stops at 100 whatever limit you ask for.
+
+**Split `UNKNOWN` on the exit status.** Non-zero is a failed read. Zero with `UNKNOWN` is a
+successful read this library cannot judge for completeness, which is what a custom adapter returns
+when no `limit` is passed. Reporting that as a failure would be its own false claim.
+
+Pass an explicit `limit` where you can. The rows in the table below pass none, so they take the
+configured default (`tracker.list_default_limit`, 30) on `gh` and `glab`, and they report `UNKNOWN`
+on a custom tracker.
+
+Do not write `items=$(tracker_list …)` and then read `TRACKER_LIST_STATUS`. A subshell cannot pass
+that variable back, so you would read a stale verdict from an earlier project.
+
+> **Scope caveat (forge axis, #711).** The **PR** sources still call `gh pr list` / `gh api …/pulls`. The PR/MR forge abstraction is #711; until it lands, those sources are GitHub-only, so `/tasks` is *issue-axis* tracker-agnostic, not fully tracker-agnostic. Filters GitHub expresses but GitLab can't (`mentions:`, `commenter:`, `assignee=none` on glab) degrade to a gh-only path or empty, noted per source.
 
 ## Usage
 
@@ -37,16 +87,18 @@ Iterates every project in `apexyard.projects.yaml` (the registry at the root of 
 
 The task list is the union of:
 
-| Source | Tool |
-|--------|------|
-| PRs awaiting your review | `gh pr list --search "review-requested:@me is:open"` |
-| PRs you authored that are blocked on you (changes requested, conflicts, failing CI) | `gh pr list --search "author:@me is:open review:changes_requested"` |
-| Issues assigned to you with high priority | `gh issue list --assignee @me --label priority-high,priority-critical` |
-| Issues you opened with new comments | `gh issue list --search "author:@me commenter:>@me is:open"` |
-| Mentions in unresolved threads | `gh search issues "mentions:@me is:open"` |
-| PR comments awaiting your response | `gh api repos/{repo}/pulls/{n}/comments` filtered to threads where you were mentioned and the last reply isn't yours |
-| Open Critical/High issues with no assignee in projects you own | `gh issue list --label priority-critical --assignee none` |
-| Failing CI on your authored open PRs | from `statusCheckRollup` |
+| Source | Tool | Axis |
+|--------|------|------|
+| PRs awaiting your review | `gh pr list --search "review-requested:@me is:open"` | forge (#711) |
+| PRs you authored that are blocked on you (changes requested, conflicts, failing CI) | `gh pr list --search "author:@me is:open review:changes_requested"` | forge (#711) |
+| Issues assigned to you with high priority | `tracker_list "$repo" assignee=@me labels=priority-high,priority-critical` | issue ✓ |
+| Issues you opened with new comments | `tracker_list "$repo" state=open author=@me` + client-side comment-recency filter (`commenter:` is gh-only) | issue ✓ |
+| Mentions in unresolved threads | gh-only: `gh search issues "mentions:@me is:open"` (empty on non-gh trackers) | issue (gh-only) |
+| PR comments awaiting your response | `gh api repos/{repo}/pulls/{n}/comments` filtered to threads where you were mentioned and the last reply isn't yours | forge (#711) |
+| Open Critical/High issues with no assignee in projects you own | `tracker_list "$repo" labels=priority-critical assignee=none` (`assignee=none` degrades on glab) | issue ✓ |
+| Failing CI on your authored open PRs | from `statusCheckRollup` | forge (#711) |
+
+Label semantics note: `labels=priority-high,priority-critical` is passed to each CLI's native `--label` handling, which is **AND** on both gh and glab. The intent here (high **OR** critical) is a pre-existing GitHub-search limitation carried over unchanged — call the two labels in separate `tracker_list` passes and union the results if strict OR is needed.
 
 ## Prioritisation
 

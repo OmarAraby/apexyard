@@ -16,9 +16,31 @@ Private project identifiers (names, repo slugs, workspace paths) belong in your 
 
 ## What gets scrubbed
 
-- `.projects[].name` — whole-word match, case-insensitive. Skipped when the name is the target repo's own name (mentioning "apexyard" in an apexyard upstream ticket is fine).
+- `.projects[].name` — whole-word match, case-insensitive. Skipped entirely when the name is the target repo's own bare name (mentioning "apexyard" in an apexyard upstream ticket is fine). Also skipped when the name equals the target repo's **owner login** (me2resh/apexyard#1387). This owner exemption applies only inside the `@owner` or `owner/<repo-slug>` forms. A bare, standalone mention of the owner's name still blocks, like any other registered private project's name.
 - `.projects[].repo` — exact `owner/repo` match, optionally followed by `#<N>` to catch ticket references. Skipped when equal to the target repo.
 - `.projects[].workspace` — whole-word match on the workspace path.
+
+## Public registry entries — `public: true`
+
+A registered project whose repo is public — a public marketing site, say —
+is not a private identifier. Add `public: true` to that entry in
+`apexyard.projects.yaml`:
+
+```yaml
+- name: marketing-site
+  repo: your-org/marketing-site
+  public: true
+```
+
+Every leak hook (`check-private-refs-staged.sh`, `check-private-refs-runtime.sh`,
+`block-private-refs-in-public-repos.sh`) reads the field through the shared
+parser at `.claude/hooks/_lib-registry-parser.sh` and skips that entry's
+`name`, `repo`/`repos`, and `workspace` when scanning for a leak
+(me2resh/apexyard#1455). Omitting the field, or setting it to anything other
+than `true`, keeps the entry private — the hooks fail closed by default.
+
+`public: true` is per-entry, not global: an unrelated private project two
+entries down in the same registry still blocks normally.
 
 ## What does NOT get scrubbed
 
@@ -38,7 +60,7 @@ The hook then exits 0 and prints a one-line warning to stderr. The marker is del
 
 ## When the hook fires
 
-Wired to `PreToolUse` on `Bash` for five command shapes:
+Wired to `PreToolUse` on `Bash` for ten command shapes:
 
 | Shape | Example |
 |-------|---------|
@@ -47,6 +69,66 @@ Wired to `PreToolUse` on `Bash` for five command shapes:
 | `gh issue comment --repo` | `gh issue comment 42 --repo me2resh/apexyard --body "..."` |
 | `gh pr comment --repo` | `gh pr comment 42 --repo me2resh/apexyard --body "..."` |
 | `gh api .../issues\|/pulls` | `gh api repos/me2resh/apexyard/issues -f title=... -f body=...` |
+| `gh pr review --repo` | `gh pr review 42 --repo me2resh/apexyard --comment --body "..."` |
+| `gh pr merge --repo` | `gh pr merge 42 --repo me2resh/apexyard --squash --subject "..." --body "..."` |
+| `tracker_create` wrapper | `tracker_create "me2resh/apexyard" "title" "/tmp/body.md"` |
+| `tracker_review_submit` wrapper | `tracker_review_submit "me2resh/apexyard" "42" "comment" "/tmp/body.md"` |
+| `tracker_pr_merge` wrapper | `tracker_pr_merge "me2resh/apexyard" "42" "squash" true "subject" "/tmp/body.md"` |
+
+me2resh/apexyard#1206 added the last five rows. Two reviewers found the
+wrapper gap independently. `code-reviewer.md` tells Rex to call
+`tracker_review_submit`, not `gh pr review`, for every review.
+`/approve-merge`'s SKILL.md states its own command text never contains
+`gh pr merge`. Each wrapper runs its `gh` call inside a sourced shell
+function.
+
+The wrapper scan resolves only a literal `owner/repo` in argument 1. It
+cannot expand a shell variable or a value on a later line. Pass the target as
+a literal slug, or the hook cannot identify the public repository. Keep the
+body-file argument on the same command line for the same reason. A follow-up
+must add a fail-closed response for unresolved wrapper arguments.
+
+No second command event fires for that inner call. This hook had zero
+matchers for `gh pr review`, `gh pr merge`, or any of the three wrapper
+names before #1206. A private reference posted through any of these five
+shapes reached a public repo unscanned.
+
+**Staged-content gate:** `check-private-refs-staged.sh` scans complete staged
+blobs during Git's native `pre-commit` hook. It blocks a project name, repo
+slug, or workspace path before that version can enter commit history. The
+check reads the index rather than a rendered net diff. An add-then-remove
+sequence cannot hide the first commit because the first commit is blocked.
+The diagnostic names the file and withholds the matched identifier.
+
+**Origin-private skip and push-time scan (#1528, AgDR-0220):** when `origin`
+is confirmed private, the staged scan exits 0, because a local commit leaks
+nothing. The protected-branch guard in `.githooks/pre-commit` still runs.
+`check-private-refs-push.sh`, called from `.githooks/pre-push`, scans every
+new blob, commit and tag object (message and author headers), file and
+directory name, and pushed ref name, including binary files and merge
+resolutions. It trusts only the remote sha git reports and tips it already
+scanned clean for the same registry; remote-tracking refs are never trusted. It skips only
+a remote that is confirmed private. Public-class remotes (the
+`public_framework_repos` list, the `upstream` remote, a registry entry with
+`public: true`), an unknown or failed visibility lookup, and non-GitHub hosts
+all scan. Visibility comes from `gh api repos/<slug> --jq .private`, cached
+24 hours in local git config (a failed lookup for 10 minutes). Skipping hooks on push skips this scan like any
+git hook. There is no dedicated skip variable.
+
+The tracker adapters also run `check-private-refs-runtime.sh` after resolving
+their arguments. This covers `tracker_create`, `tracker_review_submit`, and
+`tracker_pr_merge` when their repository or body-file argument comes from a
+shell variable. The command-text hook still protects direct `gh` calls.
+
+Git's `--no-verify` option and a clone without `core.hooksPath=.githooks`
+can bypass the staged-content and push-time gates. The command-layer hook remains a backstop
+for agent-driven writes. Treat either bypass as reduced protection, not as a
+reason to commit private identifiers.
+
+**Scope limit:** this hook matches `gh` command text only. It does not
+match `glab`. A GitLab adopter's `tracker.kind: glab` project sends review
+bodies through `_tracker_review_glab`. That function pipes the body into
+`glab mr note create -m`. No hook scans it at any point.
 
 The hook silently exits 0 in three no-op cases:
 
@@ -54,11 +136,65 @@ The hook silently exits 0 in three no-op cases:
 2. **`apexyard.projects.yaml` missing** — no registry = no scrub list. The hook has nothing to enforce.
 3. **Empty title + empty body + no body-file** — `gh ... comment <n>` without a `-b` / `-F` opens the editor; the hook has nothing to scan.
 
+## Remediation — when a private reference reaches a public repo anyway
+
+This section states what to do once a private reference reaches a public
+repo. Gaps 1 and 2 of me2resh/apexyard#1206 are prevention, not
+remediation. State this plainly to whoever runs the remediation. Every
+self-service action below reduces exposure. GitHub Support can end
+exposure on your own repository. It cannot end exposure inside a fork.
+
+The evidence for this claim is direct, not theoretical. Two remediations
+ran on the #1206 incident within the same hour:
+
+| Action | What it fixes | What it leaves |
+|---|---|---|
+| Edit or delete the comment, review, or PR body through the API | The rendered page and the current REST response | Email notifications already sent, third-party scrapes, and the GitHub search index |
+| Redact the file in a later commit | The file at the branch tip | The earlier commit, still served by the public API at its own SHA |
+| Rewrite the branch history and force-push (with or without a squash) | The branch tip, the Commits tab, and the base branch's ancestry | The orphaned commit, still served by SHA. The force-push itself publishes that SHA in the PR's own timeline event |
+| Contact GitHub Support to purge unreachable objects | The object itself, once GitHub confirms the purge | Copies already fetched by mirrors, clones, or scrapers before the purge. Content already living in a fork |
+
+After the redact-then-commit and the rewrite-then-squash had both run,
+`gh api repos/<repo>/contents/<path>?ref=<pre-rewrite-sha>` still returned
+48,174 bytes containing 2 occurrences. The rewrite changed where the
+content was reachable from. It did not remove it.
+
+GitHub's own guide, ["Removing sensitive data from a repository"](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository),
+confirms this for the rewrite-and-force-push step. It states: "If you only
+rewrite your history and force push it, the commits with sensitive data
+may still be accessible elsewhere: in any clones or forks of your
+repository; directly via their SHA-1 hashes in cached views on GitHub;
+through any pull requests that reference them." Permanently removing the
+cached views and PR references requires "contacting us through the GitHub
+Support portal."
+
+A fork is a separate, harder case. GitHub's guide says you "will need to
+coordinate with the owners of the forks, asking them to remove the
+sensitive data or delete the fork entirely." It gives the reason: "GitHub
+cannot provide contact information for these owners." GitHub Support can
+purge your own repository's objects. It cannot reach a fork.
+
+### Runbook
+
+1. File the GitHub Support request first. Every other action in this list
+   can run before GitHub responds.
+2. Redact the leaked content in a new commit next.
+3. If the leak sits in a comment, a review, or a PR body, delete or edit
+   it through the API. Use `gh api -X DELETE` or `gh api -X PATCH`.
+4. Check GitHub for a fork of the public repo. Use
+   `gh api repos/<owner>/<repo>/forks` or the repository's network graph.
+   If a fork holds the leak, contact its owner directly. GitHub Support
+   cannot remove content from a fork.
+5. Until GitHub Support confirms the purge, the incident status must read
+   reduced exposure. It must not read removed or fixed.
+6. The incident closes when GitHub Support confirms the purge. It can also
+   close when a review finds the exposed content carried no real risk.
+
 ## False-positive handling
 
 If a project's `name` collides with a generic word (a project literally named `auth`, or `core`), the hook will block any upstream ticket that uses that word. Mitigations:
 
-1. **Don't register a private project under a generic one-word name.** `curios-dog` is fine; `auth` is not. This is a good principle independent of leak protection — it also stops `/projects` and `/tasks` from colliding.
+1. **Don't register a private project under a generic one-word name.** `sample-app` is fine; `auth` is not. This is a good principle independent of leak protection — it also stops `/projects` and `/tasks` from colliding.
 2. **Use the skip marker** when you've confirmed the match is incidental. The warning that accompanies the bypass is visible and auditable.
 3. **Omit the `name` field temporarily** — the hook reads only registered fields, so redacting one project's name in the registry removes it from the scrub list. Least-preferred option; you lose discovery in `/projects` for that project.
 
@@ -69,7 +205,9 @@ The leak-protection hook is a **sibling to `check-secrets.sh`** — both scan ou
 | Hook | Protects | When |
 |------|----------|------|
 | `check-secrets.sh` | API keys, passwords, tokens | `git commit` time (staged diff) |
-| `block-private-refs-in-public-repos.sh` | Project names, repo slugs, workspace paths | `gh` tracker-write time (title + body) |
+| `block-private-refs-in-public-repos.sh` | Project names, repo slugs, workspace paths | `gh` tracker-write time (issue/PR title + body, review body, merge-commit subject/body) |
+| `check-private-refs-staged.sh` | Project names, repo slugs, workspace paths in complete files | Git-native `pre-commit` time (staged blobs); skipped when origin is confirmed private |
+| `check-private-refs-push.sh` | Same identifiers in new blobs and messages of pushed objects | Git-native `pre-push` time; skipped only for a confirmed-private remote |
 
 Both are backstops against routine-but-damaging leaks. Self-discipline is the primary defence; the hook catches the cases where the agent had the private information right in front of it while writing the upstream content and didn't actively suppress it.
 

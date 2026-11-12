@@ -12,6 +12,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/warn-stale-review-markers.sh"
 LIB_MARKERS="$(cd "$(dirname "$0")/.." && pwd)/_lib-review-markers.sh"
 if [ ! -x "$HOOK_SRC" ]; then
@@ -358,6 +363,111 @@ case9() {
   rm -rf "$sb"
 }
 
+# -------- CASE 10: #887 same-repo-fork-PR — gh calls must be origin-scoped --------
+# A fork checkout with BOTH `origin` (the fork) and `upstream` (the canonical
+# parent) configured — the exact layout that makes gh's ambient default-repo
+# resolution prefer "upstream" over "origin" (see me2resh/apexyard#887, and
+# the follow-up fix to `pr_base_repo` in #765/#898). This stub returns the
+# CORRECT PR data only when `gh pr view` is scoped with `--repo <origin>`;
+# an unscoped call returns a deliberately WRONG PR number/repo/SHA, so the
+# test fails loudly if the hook ever regresses to trusting gh's ambient
+# default instead of the checkout's own origin remote.
+write_gh_stub_fork_aware() {
+  local sb="$1" origin_repo="$2" correct_num="$3" correct_sha="$4"
+  cat > "$sb/bin/gh" <<STUB
+#!/bin/bash
+args="\$*"
+origin_repo="$origin_repo"
+correct_num="$correct_num"
+correct_sha="$correct_sha"
+STUB
+  cat >> "$sb/bin/gh" <<'STUB_TAIL'
+scoped=0
+repo=""
+prev=""
+for a in $args; do
+  if [ "$prev" = "--repo" ]; then repo="$a"; scoped=1; fi
+  prev="$a"
+done
+if [ "$scoped" -eq 1 ] && [ "$repo" = "$origin_repo" ]; then
+  case "$args" in
+    *"--json number"*)         echo "$correct_num"; exit 0 ;;
+    *"headRefOid"*)            echo "$correct_sha"; exit 0 ;;
+    *"headRepository"*)        echo "$origin_repo"; exit 0 ;;
+  esac
+  exit 0
+fi
+if [ "$scoped" -eq 1 ]; then
+  # Scoped to a repo other than origin — gh would 404 in reality.
+  exit 1
+fi
+# UNSCOPED call: models gh's ambient parent-preferring default resolving
+# successfully but WRONGLY. A fixed hook must never reach this branch when
+# an origin remote is configured.
+case "$args" in
+  *"--json number"*)   echo "999"; exit 0 ;;
+  *"headRefOid"*)      echo "wrongsha0000000000000000000000000000wrong"; exit 0 ;;
+  *"headRepository"*)  echo "me2resh/apexyard"; exit 0 ;;
+esac
+exit 1
+STUB_TAIL
+  chmod +x "$sb/bin/gh"
+}
+
+case10() {
+  local sb
+  sb=$(make_sandbox)
+  (
+    cd "$sb" || exit 1
+    git remote add origin https://github.com/atlas-apex/apexyard.git
+    git remote add upstream https://github.com/me2resh/apexyard.git
+  )
+  local sha
+  sha=$(printf '9%.0s' {1..40})
+  write_gh_stub_fork_aware "$sb" "atlas-apex/apexyard" "42" "$sha"
+  # Stale marker keyed on the CORRECT (origin) repo/PR — the hook must
+  # resolve PR_NUMBER=42 and PR_REPO=atlas-apex/apexyard via the origin-
+  # scoped gh calls, find this marker, and flag it stale against the
+  # correct (scoped) HEAD SHA — never the "999"/"wrongsha…" ambient answers.
+  local old_sha
+  old_sha=$(printf '0%.0s' {1..40})
+  local rex_marker
+  rex_marker=$(review_marker_path "atlas-apex/apexyard" 42 rex "$sb")
+  echo "$old_sha" > "$rex_marker"
+  local marker_basename
+  marker_basename=$(basename "$rex_marker")
+  run_hook "$sb" "$(push_json_success)" \
+    "Stale review marker: ${marker_basename}.*now 9999999" \
+    "887-same-repo-fork-origin-scoped"
+  rm -rf "$sb"
+}
+
+# The target repository must not supply executable helpers.
+case11() {
+  local sb sha payload marker rc
+  sb=$(make_sandbox)
+  sha=$(printf '9%.0s' {1..40})
+  write_gh_stub "$sb" "pr:42:$sha"
+  marker="$sb/helper-executed"
+  printf 'touch "%s"\n' "$marker" > "$sb/.claude/hooks/_lib-read-config.sh"
+  printf '%s\n' "$(printf '0%.0s' {1..40})" > "$sb/.claude/session/reviews/acme__repo__42-rex.approved"
+  payload=$(jq -nc --arg command "git -C '$sb' push origin feature/GH-1739-probe" --arg cwd "$sb" \
+    '{tool_name:"Bash",tool_input:{command:$command},cwd:$cwd,tool_response:{exit_code:0}}')
+  # Use the installed hook and a local gh stub.
+  printf '%s' "$payload" | PATH="$sb/bin:$PATH" bash "$HOOK_SRC" >"$sb/out" 2>"$sb/err"
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -e "$marker" ] && grep -q 'Stale review marker' "$sb/err"; then
+    echo "PASS [target-helper-not-sourced]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [target-helper-not-sourced]: rc=$rc" >&2
+    cat "$sb/err" >&2
+    FAIL=$((FAIL+1))
+    FAILED_CASES="$FAILED_CASES target-helper-not-sourced"
+  fi
+  rm -rf "$sb"
+}
+
 # Run all cases.
 case1
 case2
@@ -368,6 +478,8 @@ case6
 case7
 case8
 case9
+case10
+case11
 
 echo ""
 echo "==================================="

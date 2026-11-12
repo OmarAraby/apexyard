@@ -2,10 +2,13 @@
 name: prototype
 description: Create a throwaway UX/demo prototype ticket (mockup / demo flow) — answers "what should it look and feel like?". DISCARD-by-default; same AgDR + coverage exemptions as /spike.
 argument-hint: "<short title of the prototype>"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # /prototype — Create a Throwaway Prototype Ticket
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for prototype
+artefacts: lead with the learning goal and next action.
 
 Creates a structured GitHub Issue for a **prototype** — a disposable UX/demo artifact (clickable mockup, demo flow, interactive proof-of-concept UI) built to answer *"what should this look and feel like?"*. The output is the **learning / chosen direction**, not shippable code: a prototype is thrown away once the direction is decided.
 
@@ -41,37 +44,39 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 0. Write the active-issue-skill marker (REQUIRED — me2resh/apexyard#268)
 
 Before any `gh issue create` (or other tracker CLI), write this skill's name to the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the command through. At skill entry:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "prototype" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "prototype" > "$skill_marker"
 ```
 
 Remove the marker on **every** exit path (success, early-exit, user cancel, error):
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers from killed sessions, but a clean exit should never leave one behind. See AgDR-0030.
+The `clear-issue-skill-marker.sh` SessionStart hook clears only the current session's marker, but a clean exit should never leave one behind. See AgDR-0030.
 
 ### 1. Resolve the target repo
 
-Read `.claude/session/current-ticket` to determine which repo we're working in. If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
+Read the active-ticket marker of the working tree you are in to determine which repo we're working in. The marker is the `apexyard-ticket` file in the git dir of that tree. See `/start-ticket` "Read the active ticket". If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
 
 ```
 Which project is this prototype for?
@@ -142,6 +147,9 @@ At the budget cap, the prototype ENDS regardless of polish. What's yours?
 Reject vague answers ("a while", "until it's pretty") — push for an explicit time/effort cap.
 
 **d) Disposition (required — PROMOTE or DISCARD)**
+
+Use `AskUserQuestion` for this choice. Recommend `DISCARD` first and describe both effects.
+Use the prompt below only when the harness lacks the tool.
 
 ```
 What happens when the prototype closes — PROMOTE or DISCARD?
@@ -221,26 +229,67 @@ Create this ticket? (yes / edit / cancel)
 - **edit** / **change X** → ask what to change, update, re-show
 - **cancel** / **no** → abort
 
-### 7. Create the GitHub Issue
+### 7. Create the issue (via the tracker abstraction)
+
+Dispatch creation through `tracker_create` (#670 / AgDR-0072, extended by
+the #709 creator sweep) so the prototype lands in **this project's** tracker —
+GitHub, GitLab, or a `custom` CLI — per its `tracker:` block in
+`apexyard.projects.yaml`. For a GitHub adopter this runs `gh issue create`
+exactly as before.
 
 ```bash
-gh issue create --repo {owner/repo} \
-  --title "[Prototype] {title}" \
-  --label "prototype" \
-  --body "{formatted body}"
+# Resolve the tracker lib (it lives in the ops fork's hooks dir) by walking up
+# from the cwd; source it.
+tracker_lib="$(r="$PWD"; while [ -n "$r" ] && [ "$r" != / ]; do \
+  [ -f "$r/.claude/hooks/_lib-tracker.sh" ] && { echo "$r/.claude/hooks/_lib-tracker.sh"; break; }; \
+  r="${r%/*}"; done)"
+# shellcheck source=/dev/null
+. "$tracker_lib"
+
+# Ensure the `prototype` trigger label exists on the target tracker. Best-effort
+# (tracker_label_ensure always exits 0). Same mechanism `/spike` uses with the
+# `spike` label — downstream hooks read it to apply the workflow exemptions.
+tracker_label_ensure "{owner/repo}" "prototype" "C5DEF5" "Throw-away UX/demo prototype; exempt from AgDR + coverage gates"
+
+# Pass the body via a file (arbitrary markdown — never inline-interpolated).
+body_file="$(mktemp)"
+cat > "$body_file" <<'BODY'
+{formatted body}
+BODY
+
+# tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
+result="$(tracker_create "{owner/repo}" "[Prototype] {title}" "$body_file" "prototype")"
+rc=$?
+rm -f "$body_file"
+if [ "$rc" -eq 3 ]; then
+  echo "Tracker is 'none' (shape-only) — nothing was created in a tracker." >&2
+  echo "File this in your external system (e.g. Jira/Linear via MCP):" >&2
+  printf '%s\n' "$result"
+  exit 0
+elif [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+  echo "Prototype creation failed — check the tracker CLI / auth. Nothing was created." >&2
+  exit 1
+fi
+
+ref="$(printf '%s' "$result" | jq -r '.ref')"
+url="$(printf '%s' "$result" | jq -r '.url')"
 ```
 
-The `prototype` label is the trigger that downstream hooks (AgDR-required hooks, coverage gates) read to apply the workflow exemptions — the same mechanism `/spike` uses with the `spike` label. If the label doesn't exist on the target repo, the skill will create it via `gh label create prototype --color "C5DEF5" --description "Throw-away UX/demo prototype; exempt from AgDR + coverage gates"` (idempotent — `gh label create` errors on duplicate, the skill swallows that).
+The `prototype` label is the trigger that downstream hooks (AgDR-required hooks,
+coverage gates) read to apply the workflow exemptions — the same mechanism
+`/spike` uses with the `spike` label.
 
 ### 8. Return the URL + branch suggestion
 
+Use the `ref` / `url` parsed from `tracker_create` in step 7:
+
 ```
-Created: {owner/repo}#{number} — {title}
-{url}
+Created: {owner/repo}#${ref} — {title}
+${url}
 
 When you start work:
-  /start-ticket {owner/repo}#{number}
-  git checkout -b prototype/GH-{number}-{slug}
+  /start-ticket {owner/repo}#${ref}
+  git checkout -b prototype/GH-${ref}-{slug}
 ```
 
 ### 9. Remind the operator about the disposition gate

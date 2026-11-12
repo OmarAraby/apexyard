@@ -12,6 +12,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 LIB_SRC="$(cd "$(dirname "$0")/.." && pwd)/_lib-detect-bash-write.sh"
 if [ ! -f "$LIB_SRC" ]; then
   echo "FAIL: lib not found at $LIB_SRC" >&2
@@ -92,6 +97,9 @@ assert_write "tar xzf"              "tar xzf archive.tar.gz"
 assert_write "tar --extract"        "tar --extract --file=archive.tar"
 assert_write "curl -o"              "curl -o /tmp/x https://example.com/f"
 assert_write "curl --output"        "curl --output /tmp/x https://example.com/f"
+assert_write "curl -sSo"            "curl -sSo out.txt https://x"
+assert_write "curl -fsSLo"          "curl -fsSLo out.txt https://x"
+assert_write "curl output-dir -sSo" "curl --output-dir /tmp -sSo out.txt https://x"
 assert_write "wget -O"              "wget -O /tmp/x https://example.com/f"
 assert_write "wget --output-doc"    "wget --output-document=/tmp/x https://example.com/f"
 
@@ -132,6 +140,118 @@ assert_read  "stderr merge"   "make build 2>&1"
 assert_read  "python read"    'python3 -c "print(open(\"/tmp/x\").read())"'
 assert_read  "node read"      'node -e "console.log(require(\"fs\").readFileSync(\"/tmp/x\", \"utf8\"))"'
 
+# #1372 — the mode must be read from the SECOND argument, not from anywhere
+# inside the parentheses. The "python read" case above passes on `dev` only
+# because `/tmp/x` happens to contain no w, a or +; a realistic path does. A
+# single-argument open() is always mode 'r' in Python.
+assert_read  "python read, path contains 'a'" 'python3 -c "print(open(\"data.txt\").read())"'
+assert_read  "python read, dotted path"       'python3 -c "print(open(\".claude/x.json\").read())"'
+assert_read  "python read, explicit r mode"   'python3 -c "print(open(\"data.txt\", \"r\").read())"'
+assert_read  "python read, binary mode"       'python3 -c "print(open(\"data.txt\", \"rb\").read())"'
+
+# Write modes. None of these call .write(), so the open() mode alone decides —
+# otherwise the neighbouring `\.write\b` clause carries the verdict and the mode
+# is never actually tested. The path contains no w, a or + for the same reason:
+# with a path like "data.txt" the old form matched the filename instead.
+#
+# Only the 'x' case discriminates old from new — 'x' was absent from the old
+# mode class entirely. The 'r+' and keyword-mode cases pass either way (via the
+# literal '+' and 'w'); they are regression guards, not bug pins.
+assert_write "python open x mode"             'python3 -c "open(\"file.txt\", \"x\")"'
+assert_write "python open r+ mode"            'python3 -c "open(\"file.txt\", \"r+\")"'
+assert_write "python open keyword mode"       'python3 -c "open(\"file.txt\", mode=\"w\")"'
+
+# Nested parentheses in the path argument — the most common real write idiom.
+# A `[^)]*` form cannot cross the inner `)`, so it would miss all three. `dev`
+# catches the Path() and os.path.join() forms only by accident, via the `a` in
+# "Path" and "path"; it misses str(p) outright.
+assert_write "python open, nested Path()"     'python3 -c "open(pathlib.Path(d) / \"f\", \"w\")"'
+assert_write "python open, nested str()"      'python3 -c "open(str(p), \"w\")"'
+assert_write "python open, os.path.join"      'python3 -c "open(os.path.join(d, \"f\"), \"w\")"'
+
+# pathlib.Path.open() takes the MODE as its FIRST positional argument, unlike
+# the builtin open(file, mode). So there is no comma, and a clause written for
+# the builtin misses it — while `Path("f").open("w")` truncates a real file on
+# open, before any .write() call. Needs its own clause.
+assert_write "pathlib Path.open w"            'python3 -c "import pathlib; pathlib.Path(\"f.txt\").open(\"w\").close()"'
+assert_write "pathlib Path.open a"            'python3 -c "import pathlib; pathlib.Path(\"f.txt\").open(\"a\")"'
+assert_write "pathlib Path.open x"            'python3 -c "import pathlib; pathlib.Path(\"f.txt\").open(\"x\")"'
+assert_read  "pathlib Path.open r"            'python3 -c "import pathlib; print(pathlib.Path(\"f.txt\").open(\"r\").read())"'
+assert_read  "pathlib Path.open default"      'python3 -c "import pathlib; print(pathlib.Path(\"f.txt\").open().read())"'
+
+# Keyword-argument mode on Path.open(). There is no comma before the mode
+# token, so a clause anchoring the mode immediately after `.open(` misses it —
+# and `Path(p).open(mode="w", encoding=...)` is the more idiomatic form once
+# an encoding is also passed.
+assert_write "pathlib Path.open mode kwarg"   'python3 -c "from pathlib import Path; Path(\"f\").open(mode=\"w\")"'
+assert_write "pathlib Path.open kwarg+enc"    'python3 -c "from pathlib import Path; Path(\"f\").open(mode=\"w\", encoding=\"utf-8\")"'
+assert_read  "pathlib Path.open r kwarg"      'python3 -c "from pathlib import Path; print(Path(\"f\").open(mode=\"r\").read())"'
+
+# The mode is unknowable at the call site, so this is treated as a write.
+assert_write "python open star-args"          'python3 -c "open(*args)"'
+
+# Archive extraction writes files. `dev` caught the tarfile form only because
+# every ".tar" path contains an `a`, and never caught the zipfile form at all.
+# A mode that is not a quoted literal cannot be read, so the call counts as a
+# write. These shapes were all caught on `dev` only by the letter `a` in an
+# identifier like `path` or `args` — rename the variable and that accident
+# disappears, which is why each is pinned here rather than left to the earlier
+# plain-identifier form.
+assert_write "python open, kwarg variable mode"  'python3 -c "open(path, mode=mode)"'
+assert_write "python open, attribute mode"       'python3 -c "open(path, self.mode)"'
+assert_write "python open, argparse attr mode"   'python3 -c "open(path, args.mode)"'
+assert_write "python open, method-call mode"     'python3 -c "open(p, mode.lower())"'
+assert_write "python open, nested arg + var"     'python3 -c "open(str(path), mode)"'
+assert_write "python open, join + var mode"      'python3 -c "open(os.path.join(d, \"f\"), m)"'
+assert_write "python tarfile, kwarg var mode"    'python3 -c "import tarfile; tarfile.open(path, mode=m)"'
+assert_write "python os.open, nested arg"        'python3 -c "import os; os.open(str(path), os.O_WRONLY)"'
+assert_write "python os.open, join + O_CREAT"    'python3 -c "import os; os.open(os.path.join(d, \"f\"), os.O_CREAT)"'
+
+# A quoted argument beside a variable mode. The "no quote after the first
+# comma" form above cannot see these: the `encoding=` or the positional
+# `"utf-8"` supplies the quote, and `"utf-8"` is not a mode token either, so
+# both earlier clauses pass the call through. All four are writes on `dev`.
+assert_write "python open, var mode + encoding"  'python3 -c "open(path, mode, encoding=\"utf-8\")"'
+assert_write "python gzip, var mode + encoding"  'python3 -c "import gzip; gzip.open(path, mode, encoding=\"utf-8\")"'
+assert_write "python open, kwarg mode + newline" 'python3 -c "open(path, mode=mode, newline=\"\")"'
+assert_write "python codecs, var mode + charset" 'python3 -c "import codecs; codecs.open(path, mode, \"utf-8\")"'
+assert_write "python with-open var mode + enc"   'python3 -c "
+with open(path, mode, encoding=\"utf-8\") as f:
+    json.dump(d, f)
+"'
+
+# The read side of the same shape: a quoted `encoding=` with no mode argument
+# at all stays a read, which is the #1372 symptom this PR exists to remove.
+assert_read  "python open, encoding only"        'python3 -c "open(p, encoding=\"utf-8\").read()"'
+
+# shelve has its own mode alphabet: c creates, n creates new, w writes. Only r
+# is read-only, and none of the write letters is in the file-mode class.
+assert_write "python shelve.open c mode"         'python3 -c "import shelve; shelve.open(path, \"c\")"'
+assert_write "python shelve.open n mode"         'python3 -c "import shelve; shelve.open(path, \"n\")"'
+assert_read  "python shelve.open r mode"         'python3 -c "import shelve; shelve.open(path, \"r\")"'
+
+assert_write "python tarfile extractall"      'python3 -c "import tarfile; tarfile.open(\"b.tar\").extractall(\".\")"'
+assert_write "python zipfile extractall"      'python3 -c "import zipfile; zipfile.ZipFile(\"b.zip\").extractall(\".\")"'
+
+# tarfile write modes carry a compression suffix after ":" or "|". Those
+# characters would otherwise end the mode token early and read as a read.
+assert_write "python tarfile w:gz"            'python3 -c "import tarfile; tarfile.open(\"out.tgz\", \"w:gz\")"'
+assert_write "python tarfile w|gz stream"     'python3 -c "import tarfile; tarfile.open(\"out.tgz\", \"w|gz\")"'
+assert_write "python tarfile x:bz2"           'python3 -c "import tarfile; tarfile.open(\"out.tbz\", \"x:bz2\")"'
+assert_read  "python tarfile r:gz"            'python3 -c "import tarfile; tarfile.open(\"in.tgz\", \"r:gz\")"'
+
+# A mode held in a variable could be any mode. dev caught these only because a
+# realistic identifier like "path" contains an "a" — rename it and the accident
+# disappears, so match the shape instead.
+assert_write "python open, variable mode"     'python3 -c "open(path, mode)"'
+assert_write "python open, other var names"   'python3 -c "open(filename, filemode)"'
+assert_read  "python open, kwarg not a mode"  'python3 -c "print(open(p, encoding=\"utf-8\").read())"'
+
+# os.open takes integer flags rather than a mode string.
+assert_write "python os.open O_WRONLY"        'python3 -c "import os; os.open(path, os.O_WRONLY|os.O_CREAT)"'
+assert_write "python os.open O_APPEND"        'python3 -c "import os; os.open(path, os.O_APPEND)"'
+assert_read  "python os.open O_RDONLY"        'python3 -c "import os; os.open(path, os.O_RDONLY)"'
+
 # #153 — counterexamples for the new matcher families.
 assert_read  "cp --help"      "cp --help"
 assert_read  "cp --version"   "cp --version"
@@ -144,6 +264,10 @@ assert_read  "tar --list"     "tar --list -f archive.tar"
 assert_read  "tar -tzf"       "tar -tzf archive.tar.gz"
 assert_read  "curl -s url"    "curl -s https://example.com/f"
 assert_read  "curl bare"      "curl https://example.com/f"
+assert_read  "curl -sSL"      "curl -sSL https://x"
+assert_read  "curl -fsS"      "curl -fsS https://x"
+assert_read  "curl header"    "curl -sS -H 'X: y' https://x"
+assert_read  "curl output-dir" "curl --output-dir /tmp https://x"
 assert_read  "wget --help"    "wget --help"
 assert_read  "wget bare"      "wget https://example.com/f"
 assert_read  "deno fmt"       "deno fmt"
@@ -166,6 +290,11 @@ assert_target "cp last arg"        "cp src.txt /tmp/dst.txt"    "/tmp/dst.txt"
 assert_target "mv last arg"        "mv a.txt /tmp/b.txt"        "/tmp/b.txt"
 assert_target "curl -o path"       "curl -o /tmp/f https://example.com/f"        "/tmp/f"
 assert_target "curl --output"      "curl --output /tmp/f https://example.com/f"  "/tmp/f"
+assert_target "curl -sSo path"      "curl -sSo out.txt https://x" "out.txt"
+assert_target "curl -fsSLo path"    "curl -fsSLo out.txt https://x" "out.txt"
+assert_target "curl -sSo quotes"    "curl -sSo 'out.txt' https://x" "out.txt"
+assert_target "curl -fsSLo quotes"  'curl -fsSLo "out.txt" https://x' "out.txt"
+assert_target "curl output-dir -sSo" "curl --output-dir /tmp -sSo out.txt https://x" "out.txt"
 assert_target "wget -O path"       "wget -O /tmp/f https://example.com/f"        "/tmp/f"
 
 # --- target extraction (documented misses — empty result) --------------
@@ -218,6 +347,597 @@ assert_not_deletion_only "rm + redirect"            "rm old.ts && echo x > src/a
 assert_not_deletion_only "rm + tee"                 "rm a | tee b"
 assert_not_deletion_only "redirect only (no rm)"    "echo x > file.ts"
 assert_not_deletion_only "cp only"                  "cp a b"
+
+# --- bash_extract_write_targets (#886) — ALL targets, not just the first ---
+
+assert_targets() {
+  local label="$1" cmd="$2" want="$3"
+  local got
+  got=$(bash_extract_write_targets "$cmd" | sort | tr '\n' ',' )
+  local want_sorted
+  want_sorted=$(printf '%s' "$want" | tr ',' '\n' | sort | tr '\n' ',')
+  if [ "$got" = "$want_sorted" ]; then
+    echo "PASS [targets/$label]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [targets/$label]: cmd=$cmd  want=[$want_sorted]  got=[$got]" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}targets/${label} "
+  fi
+}
+
+# Single-target commands still return exactly one target (no regression
+# vs. the singular bash_extract_write_target).
+assert_targets "single redirect"          "echo hi > /tmp/x"                          "/tmp/x"
+assert_targets "single in-repo redirect"  "echo hi > src/app.ts"                      "src/app.ts"
+assert_targets "single tee"               "echo x | tee /tmp/x"                       "/tmp/x"
+assert_targets "single cp"                "cp src.txt /tmp/dst.txt"                   "/tmp/dst.txt"
+
+# THE #886 bypass shape: an out-of-repo (or otherwise exempt) target FIRST,
+# an in-repo target SECOND — both must be present in the extracted set so a
+# consumer can gate on the second even though the first would exempt alone.
+assert_targets "semicolon-chained: out-of-repo then in-repo" \
+  "echo a > /tmp/x; echo b > src/app.ts"                                              "/tmp/x,src/app.ts"
+assert_targets "&&-chained: out-of-repo then in-repo" \
+  "cp a.txt /tmp/b.txt && echo y > src/app.ts"                                        "/tmp/b.txt,src/app.ts"
+assert_targets "tee with multiple file operands" \
+  "echo x | tee /tmp/a src/b.ts"                                                      "/tmp/a,src/b.ts"
+assert_targets "tee -a with multiple file operands" \
+  "echo x | tee -a /tmp/a src/b.ts"                                                   "/tmp/a,src/b.ts"
+assert_targets "three semicolon-chained redirects" \
+  "echo a > /tmp/x; echo b > /tmp/y; echo c > src/app.ts"                             "/tmp/x,/tmp/y,src/app.ts"
+
+# #886/#926 (Hakim security-review finding): NO-SPACE separator+redirection.
+# Splitting on the separator can leave a segment that BEGINS with `>` —
+# e.g. `;> .gitignore` splits into a second segment of `> .gitignore`. The
+# original leading-context regex `[^|<&]>...` required a character before
+# `>` to exist at all, so it silently dropped the target at position 0.
+# These are Hakim's exact repro strings from the PR #926 review.
+assert_targets "no-space semicolon then redirect" \
+  "echo a > /tmp/ok;> .gitignore"                                                     "/tmp/ok,.gitignore"
+assert_targets "no-space semicolon+redirect with trailing command" \
+  "echo a > /tmp/ok;> .gitignore cat /etc/hostname"                                   "/tmp/ok,.gitignore"
+assert_targets "no-space && then redirect" \
+  "echo a > /tmp/ok&&> .gitignore"                                                    "/tmp/ok,.gitignore"
+assert_targets "no-space | then redirect" \
+  "echo a > /tmp/ok|> .gitignore"                                                     "/tmp/ok,.gitignore"
+assert_targets "no-space || then redirect" \
+  "echo a > /tmp/ok||> .gitignore"                                                    "/tmp/ok,.gitignore"
+
+# Sanity: the anchored fix must not turn 2>&1 (fd-dup) or a heredoc into a
+# false-positive redirection target.
+if bash_command_appears_to_write "make build 2>&1"; then
+  echo "FAIL [targets/2>&1 must not be treated as a write]" >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}targets/fd-dup-false-positive "
+else
+  echo "PASS [targets/2>&1 correctly not a write]"
+  PASS=$((PASS+1))
+fi
+assert_targets "heredoc still extracts correctly (no regression)" \
+  "$(printf 'cat > /tmp/x <<EOF\nhi\nEOF')"                                           "/tmp/x"
+
+# #886/#926 round 3 (Hakim adversarial re-hunt): the operator alternation
+# only modelled >, >>, and n> — it missed &>/&>> (redirect BOTH streams to
+# a file) and >|/>>| (force-clobber, noclobber override). Both are real,
+# destructive truncating writes. Hakim's exact repros:
+assert_targets "&> redirects both streams to a file (Hakim repro)" \
+  "echo hi &> .gitignore"                                                            ".gitignore"
+# NOTE: unlike the other rows in this block, `&>>` happens to extract
+# correctly even under the PRE-round-3 regex — not via the dedicated `&>>?`
+# alternative this fix adds, but by coincidence: the pattern's leading-context
+# class `[^|<&]` doesn't exclude `>` itself, so the SECOND `>` in `&>>` reads
+# the FIRST `>` as valid (non-excluded) leading context and matches anyway.
+# Kept here as a correctness/coverage check (it must still pass post-fix),
+# not a fail-pre/pass-post discriminator like the bare `&>` row above it.
+assert_targets "&>> append-both-streams to a file" \
+  "echo hi &>> .gitignore"                                                           ".gitignore"
+assert_targets ">| force-clobber after no-space semicolon (Hakim repro)" \
+  "echo a > /tmp/ok;>| db/migrations/006.sql"                                         "/tmp/ok,db/migrations/006.sql"
+assert_targets ">>| force-clobber-append variant" \
+  "echo a > /tmp/ok;>>| db/migrations/006.sql"                                        "/tmp/ok,db/migrations/006.sql"
+assert_targets ">| with a space after the separator (not just no-space)" \
+  "echo a > /tmp/ok; >| db/migrations/006.sql"                                        "/tmp/ok,db/migrations/006.sql"
+
+# #886/#926 round 4 (Hakim's fourth adversarial re-hunt): ZERO whitespace
+# between the operator and its target. Bash accepts this for every
+# operator — the mandatory `[[:space:]]+` this pattern used through round 3
+# silently dropped all five of these real, destructive writes. Hakim's
+# exact repros:
+assert_targets "no-space '>' (Hakim repro)" \
+  "echo hi>src/migrations/001.sql"                                                    "src/migrations/001.sql"
+assert_targets "no-space 'n>' fd-numbered (Hakim repro)" \
+  "echo a > /tmp/ok; echo b 2>src/migrations/001.sql"                                 "/tmp/ok,src/migrations/001.sql"
+assert_targets "no-space '>>' (Hakim repro)" \
+  "echo a > /tmp/ok; echo b>>src/migrations/001.sql"                                  "/tmp/ok,src/migrations/001.sql"
+assert_targets "no-space '>|' (Hakim repro)" \
+  "echo a > /tmp/ok; echo b>|src/migrations/001.sql"                                  "/tmp/ok,src/migrations/001.sql"
+assert_targets "no-space '&>' (Hakim repro)" \
+  "echo a > /tmp/ok; echo b&>src/migrations/001.sql"                                  "/tmp/ok,src/migrations/001.sql"
+
+# Sanity: relaxing whitespace to optional must NOT open a new false-positive
+# surface on fd-dup forms written with NO space either — the target
+# character class (not the whitespace requirement) is what excludes them.
+assert_targets "no-space '>&2' fd-dup — still not a write target" \
+  "echo err>&2"                                                                       ""
+assert_targets "no-space '2>&1' fd-dup — still not a write target" \
+  "make build 2>&1;true"                                                              ""
+
+# #886/#926 round 5 (Hakim's fifth adversarial re-hunt — the STRUCTURAL
+# root of the whole series): `|`/`||`-adjacent redirects. Detection
+# (bash_command_appears_to_write) used to run the redirection matcher on
+# the WHOLE, unsplit command, where a `|`-preceded `>` is excluded by the
+# leading-context class and isn't at `^` either — so `|>`/`||>`/`||>|`
+# were never even recognised as writes, let alone extracted. Extraction
+# already split first, so it found the target correctly — detection and
+# extraction DISAGREED. This block proves EXTRACTION already returns the
+# right target for these (it did before round 5 too); the real fix is in
+# the DETECTION-level test block further down, which is where the
+# structural bug actually lived.
+assert_targets "'||>' after a false command (Hakim repro)" \
+  "false ||> src/app.ts"                                                             "src/app.ts"
+assert_targets "'||>|' force-clobber after a false command (Hakim repro)" \
+  "false ||>| src/app.ts"                                                            "src/app.ts"
+assert_targets "'|>' after echo (Hakim repro)" \
+  "echo x |> src/app.ts"                                                             "src/app.ts"
+
+# Detection-level proof: bash_command_appears_to_write must ALSO recognise
+# these — this is the assertion that actually discriminates round 5 from
+# rounds 1-4, since it's the DETECTION path (not extraction) that had the
+# structural bug.
+assert_appears_to_write() {
+  local label="$1" cmd="$2"
+  if bash_command_appears_to_write "$cmd"; then
+    echo "PASS [detect/$label]"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL [detect/$label]: bash_command_appears_to_write missed: $cmd" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}detect/${label} "
+  fi
+}
+assert_appears_to_write "'||>' detected as a write (Hakim repro)"    "false ||> src/app.ts"
+assert_appears_to_write "'||>|' detected as a write (Hakim repro)"   "false ||>| src/app.ts"
+assert_appears_to_write "'|>' detected as a write (Hakim repro)"     "echo x |> src/app.ts"
+
+# Sanity: the deletion-only classifier had the identical structural bug at
+# its own direct _bdw_match_redirection call site — `rm x; false ||> y`
+# would have been wrongly classified as deletion-only (content-writing
+# hiding behind a |-adjacent redirect), exempting it from the ticket gate.
+assert_not_deletion_only "rm + '||>' hides a real write (round 5)" \
+  "rm old.ts; false ||> src/app.ts"
+
+# Sanity: the round-5 fix must NOT false-positive on fd-dup / read forms
+# that also happen to be pipe-adjacent.
+assert_targets "'| cmd 2>&1' pipe then fd-dup — not a write" \
+  "echo x | cat 2>&1"                                                                 ""
+assert_targets "'|| cmd >&2' or-chain then fd-dup — not a write" \
+  "false || echo err >&2"                                                             ""
+
+# Sanity: the broadened operator set must NOT false-positive on fd-duplication
+# forms, which look superficially similar (`&` and `>` both present) but mean
+# something entirely different — redirecting one fd to ANOTHER fd, not to a
+# file. Order in "&"/">"" matters: &> is `&` THEN `>` (a write); these forms
+# have `>` THEN `&` (a dup) and must stay unmatched.
+assert_targets "2>&1 fd-dup — not a write target" \
+  "make build 2>&1"                                                                   ""
+assert_targets ">&2 fd-dup — not a write target" \
+  "echo err >&2"                                                                      ""
+assert_targets "1>&2 fd-dup — not a write target" \
+  "cmd 1>&2"                                                                          ""
+if bash_command_appears_to_write "echo err >&2"; then
+  echo "FAIL [targets/>&2 must not be detected as appears_to_write]" >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}targets/fd-dup-appears-to-write "
+else
+  echo "PASS [targets/>&2 correctly not detected as a write]"
+  PASS=$((PASS+1))
+fi
+
+# Sanity: reads / heredocs / herestrings must still be untouched by the
+# broadened operator set.
+assert_targets "< plain read redirection — not a write" \
+  "cat < /tmp/x"                                                                      ""
+assert_targets "<<< herestring — not a write" \
+  "cat <<< 'hello'"                                                                   ""
+
+# Duplicate targets across segments collapse to one entry.
+got_dup=$(bash_extract_write_targets "echo a > /tmp/x; echo b > /tmp/x" | wc -l | tr -d ' ')
+if [ "$got_dup" = "1" ]; then
+  echo "PASS [targets/duplicate targets deduped]"
+  PASS=$((PASS+1))
+else
+  echo "FAIL [targets/duplicate targets deduped]: got $got_dup lines, want 1" >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}targets/dedupe "
+fi
+
+# Documented misses still contribute nothing (no fabricated targets).
+assert_targets "python -c (miss) contributes nothing" \
+  'python3 -c "open(\"/tmp/x\",\"w\").write(\"hi\")"'                                 ""
+
+# --- #1414: `>&word`, grouped/long sed -i, and sed `w` -----------------
+#
+# Each write below changed a file and passed the gate on dev at 5be9ecb
+# (bash 5.3.9, GNU sed 4.9). The read cases pin the exclusions that keep
+# the fix from blocking common read-only commands.
+
+# `>&word` is the second spelling of "send stdout and stderr to a file".
+assert_write "#1414 '>&word'"              "echo x >&src/app.ts"
+assert_write "#1414 '>& word'"             "echo x >& src/app.ts"
+assert_write "#1414 '1>&word'"             "echo x 1>&src/app.ts"
+assert_write "#1414 word ending in a digit" "echo x2>&out.txt"
+assert_write "#1414 '>&' word not all digits" "echo x >&9f1"
+assert_write "#1414 '>&' quoted word"      'echo x >&"out.txt"'
+assert_read  "#1414 '>&2' descriptor copy" "echo x >&2"
+assert_read  "#1414 '1>&2' descriptor copy" "echo x 1>&2"
+assert_read  "#1414 '>&12' descriptor copy" "echo x >&12"
+assert_read  "#1414 '>&-' closes stdout"   "echo x >&-"
+assert_read  "#1414 '3>&-' closes fd 3"    "exec 3>&-"
+assert_read  "#1414 '>&3-' moves fd 3"     "echo x >&3-"
+assert_read  "#1414 '3>&1' descriptor copy" "exec 3>&1"
+assert_targets "#1414 '>&word' target"     "echo x >&src/app.ts"                "src/app.ts"
+assert_targets "#1414 '>& word' target"    "echo x >& src/app.ts"               "src/app.ts"
+assert_targets "#1414 fd copy then '>&word'" "echo a >&2; echo b >&out.txt"     "out.txt"
+assert_target  "#1414 '>&word' single target" "echo x >&src/app.ts"             "src/app.ts"
+assert_not_deletion_only "#1414 rm + '>&word' hides a real write" \
+  "rm old.ts; echo x >&src/app.ts"
+
+# sed -i inside a group of short flags, with a suffix, or as --in-place.
+assert_write "#1414 sed -Ei"               "sed -Ei 's/a/b/' src/app.ts"
+assert_write "#1414 sed -ni"               "sed -ni 's/a/b/p' src/app.ts"
+assert_write "#1414 sed -si"               "sed -si 's/a/b/' src/app.ts"
+assert_write "#1414 sed -ie (suffix e)"    "sed -ie 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in-place"        "sed --in-place 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in-place=.bak"   "sed --in-place=.bak 's/a/b/' src/app.ts"
+assert_read  "#1414 sed -ei runs script i" "sed -ei src/app.ts"
+assert_read  "#1414 sed -f script file"    "sed -f script.sed src/app.ts"
+assert_read  "#1414 sed --posix"           "sed --posix 's/a/b/' src/app.ts"
+assert_targets "#1414 sed -Ei target"      "sed -Ei 's/a/b/' src/app.ts"        "src/app.ts"
+assert_targets "#1414 sed --in-place target" "sed --in-place 's/a/b/' src/app.ts" "src/app.ts"
+
+# sed `w` / `W` command and the `s///w` flag.
+assert_write "#1414 sed w command"         "sed -n 'w out.txt' in.txt"
+assert_write "#1414 sed /re/w"             "sed -n '/re/w out.txt' in.txt"
+assert_write "#1414 sed s///w flag"        "sed 's/a/b/w out.txt' in.txt"
+assert_write "#1414 sed s///gw flags"      "sed 's/a/b/gw out.txt' in.txt"
+assert_write "#1414 sed 1w"                "sed -n '1w out.txt' in.txt"
+assert_write "#1414 sed \$w"               "sed -n '\$w out.txt' in.txt"
+assert_write "#1414 sed 1,3w"              "sed -n '1,3w out.txt' in.txt"
+assert_write "#1414 sed 1!w"               "sed -n '1!w out.txt' in.txt"
+assert_write "#1414 sed p;w"               "sed -n 'p;w out.txt' in.txt"
+assert_write "#1414 sed p; w"              "sed -n 'p; w out.txt' in.txt"
+assert_write "#1414 sed s|a|b|w"           "sed 's|a|b|w out.txt' in.txt"
+assert_write "#1414 sed W command"         "sed -n 'W out.txt' in.txt"
+assert_write "#1414 sed -e 'w file'"       "sed -n -e 'w out.txt' in.txt"
+assert_read  "#1414 sed s/w/x/ is a read"  "sed 's/w/x/' in.txt"
+assert_read  "#1414 sed /warning/p is a read" "sed -n '/warning/p' in.txt"
+assert_read  "#1414 sed /^w/p is a read"   "sed -n '/^w/p' in.txt"
+assert_read  "#1414 sed s/www/x/g is a read" "sed 's/www/x/g' in.txt"
+assert_read  "#1414 sed y/w/x/ is a read"  "sed 'y/w/x/' in.txt"
+assert_read  "#1414 sed s#w#x# is a read"  "sed 's#w#x#' in.txt"
+assert_read  "#1414 sed s/a w b/c/ is a read" "sed 's/a w b/c/' in.txt"
+assert_read  "#1414 quoted operand starting with w" "sed -n p 'words.txt'"
+assert_read  "#1414 'w x' with no sed"     "echo 'w x'"
+assert_targets "#1414 sed w target"        "sed -n 'w out.txt' in.txt"          "out.txt"
+assert_targets "#1414 sed s///w target"    "sed 's/a/b/w out.txt' in.txt"       "out.txt"
+assert_targets "#1414 sed w after ; in the script" \
+  "sed -n 'p;w out.txt' in.txt"                                                  "out.txt"
+assert_target  "#1414 sed w: single-target extractor returns empty (plural only)" \
+  "sed -n '/re/w out.txt' in.txt"                                                ""
+assert_not_deletion_only "#1414 rm + sed w hides a real write" \
+  "rm old.ts; sed -n 'w src/app.ts' in.txt"
+
+# fd copies that end at `)`, a backtick, or a quote stay reads. Each of
+# these reported a write to `1)`, `` 1` ``, or `2` before the fix.
+assert_read  "#1414 \$(cmd 2>&1) is a read"       'out=$(npm test 2>&1)'
+assert_read  "#1414 backtick cmd 2>&1 is a read"  'result=`ls 2>&1`'
+assert_read  "#1414 (cmd 2>&1) subshell is a read" '(cd sub && make 2>&1)'
+assert_read  "#1414 bash -c \"cmd 2>&1\" is a read" 'bash -c "npm test 2>&1"'
+assert_read  "#1414 bash -c 'cmd >&2' is a read"  "bash -c 'echo hi >&2'"
+assert_read  "#1414 grep '>&2' is a read"         "grep -rn '>&2' .claude/hooks/"
+assert_read  "#1414 >&\"2\" quoted fd copy"        'echo x >&"2"'
+assert_read  "#1414 \$(cmd 2>&1) || echo"          'r=$(npm test 2>&1) || echo "$r"'
+assert_write "#1414 >&2} writes a file named 2}"  "echo x >&2}"
+
+# More sed -i spellings, and dash-words that are not sed flags.
+assert_write "#1414 sed --i (prefix)"             "sed --i 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in (prefix)"            "sed --in 's/a/b/' src/app.ts"
+assert_write "#1414 sed --in-pl=.bak (prefix)"    "sed --in-pl=.bak 's/a/b/' src/app.ts"
+assert_read  "#1414 find ... -exec sed ... -print" "find . -name '*.md' -exec sed -n 1p {} + -print"
+assert_read  "#1414 sed s/ -api/x/ is a read"     "sed 's/ -api/x/' in.txt"
+assert_read  "#1414 commit message mentioning sed -pi" 'git commit -m "fix sed -pi flag doc"'
+
+# More sed w positions.
+assert_write "#1414 sed s#a#b#w"                  "sed 's#a#b#w out.txt' in.txt"
+assert_write "#1414 sed s/a/b/pw"                 "sed 's/a/b/pw out.txt' in.txt"
+assert_write "#1414 sed /re/Iw"                   "sed -n '/re/Iw out.txt' in.txt"
+assert_write "#1414 sed s,a,b,w"                  "sed 's,a,b,w out.txt' in.txt"
+assert_write "#1414 sed s:a:b:w"                  "sed 's:a:b:w out.txt' in.txt"
+assert_write "#1414 sed s@a@b@w"                  "sed 's@a@b@w out.txt' in.txt"
+assert_write "#1414 sed s%a%b%w"                  "sed 's%a%b%w out.txt' in.txt"
+assert_write "#1414 sed \\,re,w"                  "sed -n '\\,re,w out.txt' in.txt"
+assert_write "#1414 sed ' w file' (space after quote)" "sed -n ' w out.txt' in.txt"
+assert_read  "#1414 sed then | grep 'w x' is a read" "sed -n 1p in.txt | grep 'w x'"
+
+# A sed -i edit whose file the extractor misses must not be hidden by an
+# exempt `w` target. Before the fix these extracted only the `w` target,
+# and the gate passed them. Now they extract nothing, and the gate fails
+# closed, as it did before #1414.
+assert_write   "#1414 sed -i with s///w /dev/stdout" 'sed -i "s/foo/bar/w /dev/stdout" src/app.ts'
+assert_targets "#1414 sed -i + exempt w target yields no target" \
+  'sed -i "s/foo/bar/w /dev/stdout" src/app.ts'                                  ""
+# sed is outside the data-only allowlist, so the scrubber returns raw. A
+# top-level ";" inside the quoted script still splits segments, so neither
+# target is extracted reliably. Empty targets match upstream/dev / bb447a9.
+# The ticket gate still blocks via appears_to_write + unextractable write.
+assert_targets "#1414 sed -i with ;w yields no target" \
+  "sed -i 's/a/b/;w /tmp/x' src/app.ts"                                          ""
+assert_targets "#1414 sed w then sed -i yields no target" \
+  'sed -n "w /tmp/x" in.txt && sed -i "s/a/b/" src/app.ts'                       ""
+assert_targets "#1414 sed -i file and its w file both extracted" \
+  "sed -i 's/a/b/w /tmp/log' src/app.ts"                                         "src/app.ts,/tmp/log"
+assert_targets "#1414 in-repo w file beside an exempt sed -i file" \
+  "sed -i 's/a/b/w src/b.ts' /tmp/x.txt"                                         "/tmp/x.txt,src/b.ts"
+
+# A sed `w` decoy must not hide another family's write that has no
+# extractable target. The segment pass finds nothing, so the `w` target
+# is held back, and the gate fails closed as it did before #1414.
+assert_targets "#1414 awk -i inplace + w decoy yields no target" \
+  "awk -i inplace 1 src/app.ts; sed -n 'w /tmp/x' in.txt"                        ""
+assert_targets "#1414 python -c + w decoy yields no target" \
+  "python3 -c \"open('src/app.ts','w').write('x')\"; sed -n 'w /tmp/x' in.txt"   ""
+assert_targets "#1414 tar -x + w decoy yields no target" \
+  "tar -xf a.tar; sed -n 'w /tmp/x' in.txt"                                      ""
+assert_targets "#1414 go run + w decoy yields no target" \
+  "go run ./gen && sed -n 's/x/y/w /dev/stdout' out.txt"                         ""
+assert_targets "#1414 rm is not a decoy victim: w target kept" \
+  "rm -f old.ts; sed -n 'w /tmp/x' in.txt"                                       "/tmp/x"
+
+# One case for each family in _bdw_detects_other_write whose write has no
+# extractable target. Each pins that family's entry. Dropping one from the
+# helper would let the exempt `w` decoy unlock that family's write.
+while IFS= read -r fam_cmd; do
+  [ -z "$fam_cmd" ] && continue
+  assert_targets "#1414 w decoy beside: ${fam_cmd:0:44}" \
+    "$fam_cmd; sed -n 'w /tmp/x' in.txt"                                         ""
+done <<'FAMILIES'
+node -e "require('fs').writeFileSync('src/app.ts','x')"
+ruby -e "File.write('src/app.ts','x')"
+perl -e "unlink 'src/app.ts'"
+php -r "file_put_contents('src/app.ts','x');"
+deno run --allow-write gen.ts
+bun run gen.ts
+go run ./gen
+python3 -c "open('src/app.ts','w').write('x')"
+dd if=/dev/zero of=src/app.ts count=1
+install -m 644 a.ts src/app.ts
+curl --output=src/app.ts https://example.com/f
+wget --output-document=src/app.ts https://example.com/f
+tar -xf a.tar
+awk -i inplace 1 src/app.ts
+sed -i "s/a/b/" src/app.ts
+FAMILIES
+
+# Redirects and tee normally yield a target. Their entries matter only
+# when the target strips to nothing, as with an empty quoted word. These
+# two cases pin those entries, so the helper keeps parity with
+# bash_command_appears_to_write.
+assert_targets "#1414 w decoy beside a redirect to an empty word" \
+  "echo x > \"\"; sed -n 'w /tmp/x' in.txt"                                      ""
+assert_targets "#1414 w decoy beside tee with an empty word" \
+  "echo x | tee \"\"; sed -n 'w /tmp/x' in.txt"                                  ""
+
+# The heredoc families need the decoy first, because a heredoc ends on a
+# line that holds only its terminator.
+#
+# Expect empty targets — same as upstream/dev. python3/node/ruby sit outside
+# the data-only allowlist (AgDR-0181), so the write detector sees the heredoc
+# body. That fires _bdw_detects_other_write and holds the sed `w` decoy back.
+# Scrubbing at 39c5b95 blanked the body and yielded /tmp/x. Returning raw for
+# non-allowlisted tools restores the pre-scrub hold-back, not that scrub-era
+# result.
+assert_targets "#1414 w decoy before a python heredoc" \
+  "$(printf "sed -n 'w /tmp/x' in.txt; python3 - <<'PY'\nopen('src/app.ts','w').write('x')\nPY")" ""
+assert_targets "#1414 w decoy before a node heredoc" \
+  "$(printf "sed -n 'w /tmp/x' in.txt; node <<'JS'\nrequire('fs').writeFileSync('src/app.ts','x')\nJS")" ""
+assert_targets "#1414 w decoy before a ruby heredoc" \
+  "$(printf "sed -n 'w /tmp/x' in.txt; ruby <<'RB'\nFile.write('src/app.ts','x')\nRB")" ""
+
+# An escaped quote after an fd copy stays a read.
+assert_read  "#1414 escaped quote after 2>&1 is a read" 'bash -c "sh -c \"make 2>&1\""'
+
+# BSD sed documents -I as in-place. GNU rejects it.
+assert_write "#1414 sed -I (BSD in-place)"        "sed -I '' 's/a/b/' src/app.ts"
+
+# --- #931 residual 1: `<>` read-write open is now DETECTED as a write ---
+#
+# `[n]<>word` opens `word` for both reading AND writing — a real,
+# non-truncating write that every #886/#926 round missed entirely (the
+# leading `<` was always excluded by the OTHER operators' own
+# leading-context class, so `<>` was structurally invisible, not just an
+# uncovered edge case). #931 decided to DETECT rather than
+# document-as-accepted: the ticket gate cares about "was tracked content
+# touched", not "was it truncated".
+
+assert_write  "<> read-write open, fd-numbered (#931)"  "exec 3<> /tmp/x"
+assert_write  "<> read-write open, no fd, no space (#931)" "cmd <>file.txt"
+assert_write  "<> read-write open, fd + space (#931)"   "exec 3<> file.txt"
+
+assert_target "<> extracts the file target (#931)" \
+  "exec 3<> /tmp/x"                                                                   "/tmp/x"
+assert_targets "<> extracts the file target, multi-target form (#931)" \
+  "exec 3<> src/app.ts"                                                               "src/app.ts"
+
+# Sanity: `<>` must not be confused with heredoc (`<<`) or herestring
+# (`<<<`) — both contain repeated `<`, never the exact `<` immediately
+# followed by `>` this operator requires.
+assert_targets "<< heredoc still not a <> false-positive (#931)" \
+  "$(printf 'cat > /tmp/x <<EOF\nhi\nEOF')"                                           "/tmp/x"
+assert_targets "<<< herestring still not a <> false-positive (#931)" \
+  "cat <<< 'hello'"                                                                   ""
+
+# Sanity: a `<>` write hiding behind an `rm` must not be misclassified as
+# deletion-only (same shape as the round-5 `||>` sanity check above).
+assert_not_deletion_only "rm + '<>' hides a real write (#931)" \
+  "rm old.ts; exec 3<> src/app.ts"
+
+# --- #931 residual 2: `>(…)` / `<(…)` process substitution no longer
+#     over-blocked ---
+#
+# `diff a >(sort)` is NOT a file write — `>(sort)` is process substitution
+# (a subshell command wired to a fifo/fd path), syntactically adjacent to
+# `>` but semantically nothing like a redirect target. Pre-#931 the target
+# class allowed a leading `(` and so fabricated `(sort)` as if it were a
+# filename — a fail-closed (over-blocking) false positive, not a bypass,
+# but worth tightening since it needlessly blocked a common construct
+# (`diff a >(sort)`, `tee >(logger)`, etc.) behind the ticket gate.
+
+assert_read "diff with >(...) process substitution is NOT a write (#931)" \
+  "diff a >(sort)"
+assert_read "<(...) process substitution on the read side (#931, already fine)" \
+  "diff <(sort a) <(sort b)"
+
+assert_targets ">(...) process substitution contributes no target (#931)" \
+  "diff a >(sort)"                                                                    ""
+
+# The exact shape from #931's own repro: a REAL write earlier in a
+# no-space-chained command, a process-substitution tail after it — only
+# the real target must surface, and detection must still fire (because of
+# the first, real write).
+assert_appears_to_write "real write + >(...) tail still detected (#931)" \
+  "echo a > /tmp/ok;diff x >(sort)"
+assert_targets "real write + >(...) tail: only the real target surfaces (#931)" \
+  "echo a > /tmp/ok;diff x >(sort)"                                                    "/tmp/ok"
+
+# Sanity: the leading-`(` exclusion must NOT reject a legitimate filename
+# that merely CONTAINS a paren not in the leading position.
+assert_targets "filename with non-leading parens still extracts (#931)" \
+  'echo hi > "file(1).txt"'                                                           "file(1).txt"
+
+# Sanity: the process-substitution exclusion must not resurrect any
+# fd-dup / force-clobber / redirect-both-streams false-negative from
+# earlier rounds.
+assert_write  ">| force-clobber still a write alongside the new exclusion (#931)" \
+  "echo a >| /tmp/x"
+assert_write  "&> both-streams still a write alongside the new exclusion (#931)" \
+  "echo hi &> .gitignore"
+assert_read   "2>&1 fd-dup still excluded alongside the new exclusion (#931)" \
+  "make build 2>&1"
+assert_read   ">&2 fd-dup still excluded alongside the new exclusion (#931)" \
+  "echo err >&2"
+
+# #1145: command substitutions and heredoc bodies are data, not file-write
+# targets. Keep the detector from reading ordinary prose as a shell command.
+assert_read "printf in command substitution is read-only (#1145)" \
+  'result="$(printf "%s" "$result" | jq -r .url)"'
+assert_targets "printf substitution has no write target (#1145)" \
+  'result="$(printf "%s" "$result" | jq -r .url)"' ""
+assert_read "git commit heredoc body is not a file write (#1145)" \
+  "git commit -F - <<'MSG'
+chore: subject
+
+Body prose ending in portfolio.
+MSG"
+assert_targets "heredoc prose has no fabricated target (#1145)" \
+  "git commit -F - <<'MSG'
+chore: subject
+
+Body prose ending in portfolio.
+MSG" ""
+
+# --- #1480: git log/diff --output, sort -o, yq -i, python3 -Bc -------------
+#
+# Each form wrote a tracked file on dev without the ticket gate seeing it.
+# Detect the write. Extract the path when the flag names it. python3 -Bc
+# stays unextractable and still blocks under the #1416 rule.
+# python3 -cB is gated conservatively even though Python reads it as -c with
+# program text B (not a bundled B flag).
+
+assert_write  "#1480 git log --output=file" \
+  "git log --output=src/app.ts"
+assert_write  "#1480 git log --output file" \
+  "git log --output src/app.ts"
+assert_write  "#1480 git diff --output=file" \
+  "git diff --output=src/app.ts"
+assert_write  "#1480 git diff --output file" \
+  "git diff --output src/app.ts"
+assert_write  "#1480 sort -o file" \
+  "sort -o src/app.ts input.txt"
+assert_write  "#1480 sort --output=file" \
+  "sort --output=src/app.ts input.txt"
+assert_write  "#1480 sort -uo file" \
+  "sort -uo src/app.ts input.txt"
+assert_write  "#1480 sort -oFILE attached" \
+  "sort -osrc/app.ts input.txt"
+assert_write  "#1480 /usr/bin/sort -o file" \
+  "/usr/bin/sort -o src/app.ts input.txt"
+assert_read   "#1480 ps --sort is not the sort command" \
+  "ps --sort -rss -o pid"
+assert_write  "#1480 yq -i file" \
+  'yq -i ".a=1" src/app.ts'
+assert_write  "#1480 yq --inplace file" \
+  'yq --inplace ".a=1" src/app.ts'
+assert_write  "#1480 yq -Pi bundled" \
+  'yq -Pi ".a=1" src/app.ts'
+assert_write  "#1480 python3 -Bc open w" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\""
+# Conservatively gated: Python treats -cB as -c with program text B.
+assert_write  "#1480 python3 -cB open w (conservative)" \
+  "python3 -cB \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python3 -W ignore -c open w" \
+  "python3 -W ignore -c \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python3 -X utf8 -c open w" \
+  "python3 -X utf8 -c \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python -W error -c open w" \
+  "python -W error -c \"open('src/app.ts','w').write('x')\""
+assert_write  "#1480 python3 -B -W ignore -c open w" \
+  "python3 -B -W ignore -c \"open('src/app.ts','w').write('x')\""
+
+assert_target  "#1480 git log --output= extracts" \
+  "git log --output=src/app.ts" "src/app.ts"
+assert_target  "#1480 git log --output space extracts" \
+  "git log --output src/app.ts" "src/app.ts"
+assert_target  "#1480 git diff --output= extracts" \
+  "git diff --output=src/app.ts" "src/app.ts"
+assert_target  "#1480 sort -o extracts" \
+  "sort -o src/app.ts input.txt" "src/app.ts"
+assert_target  "#1480 sort -uo extracts" \
+  "sort -uo src/app.ts input.txt" "src/app.ts"
+assert_target  "#1480 sort -oFILE extracts" \
+  "sort -osrc/app.ts input.txt" "src/app.ts"
+assert_target  "#1480 yq -i extracts last path" \
+  'yq -i ".a=1" src/app.ts' "src/app.ts"
+assert_target  "#1480 python3 -Bc target stays empty" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\"" ""
+
+assert_targets "#1480 git log --output= plural" \
+  "git log --output=src/app.ts" "src/app.ts"
+assert_targets "#1480 sort -o plural" \
+  "sort -o src/app.ts input.txt" "src/app.ts"
+assert_targets "#1480 yq -i plural" \
+  'yq -i ".a=1" src/app.ts' "src/app.ts"
+assert_targets "#1480 python3 -Bc plural empty" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\"" ""
+
+# Read-only neighbours must stay ungated.
+assert_read "#1480 git log --format stays a read" \
+  "git log --format='%h > %s'"
+assert_read "#1480 sort without -o stays a read" \
+  "sort src/app.ts"
+assert_read "#1480 sort -u stays a read" \
+  "sort -u file"
+assert_read "#1480 yq without -i stays a read" \
+  'yq ".a" src/app.ts'
+assert_read "#1480 yq -P stays a read" \
+  "yq -P '.a' file"
+assert_read "#1480 yq filename with -i stays a read" \
+  "yq '.a' my-i.yaml"
+
+# Hold-back parity: new families join _bdw_detects_other_write.
+assert_targets "#1480 w decoy beside git log --output" \
+  "git log --output=src/app.ts; sed -n 'w /tmp/x' in.txt" "src/app.ts,/tmp/x"
+assert_targets "#1480 w decoy beside sort -o" \
+  "sort -o src/app.ts in.txt; sed -n 'w /tmp/x' in.txt" "src/app.ts,/tmp/x"
+assert_targets "#1480 w decoy beside yq -i" \
+  "yq -i '.a=1' src/app.ts; sed -n 'w /tmp/x' in.txt" "src/app.ts,/tmp/x"
+assert_targets "#1480 w decoy beside python3 -Bc (unextracted)" \
+  "python3 -Bc \"open('src/app.ts','w').write('x')\"; sed -n 'w /tmp/x' in.txt" ""
 
 echo ""
 echo "==================================="

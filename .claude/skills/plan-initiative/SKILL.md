@@ -6,6 +6,10 @@ argument-hint: "<slug>"
 
 # /plan-initiative — Initiative → Milestones → Tasks (dependency-aware)
 
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the
+initiative document and filed milestones. Open with the outcome and remove empty
+conditional sections.
+
 The orchestrator surface above `/write-spec` and `/feature`. Quarter-shape planning for the strategic unit above features — usually 1-3 per quarter, multi-feature, multi-week — that decomposes deterministically into the existing ticket primitives the framework already governs.
 
 Slot relative to existing skills:
@@ -72,6 +76,11 @@ Decided during the **scope interview** (step 3 below), not from a flag:
 Both directories are created on first write if missing.
 
 ## Process
+
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
 
 ### 1. Resolve the slug + check for an existing initiative doc
 
@@ -144,6 +153,9 @@ Avoid output measures ("ship 10 features"). Prefer outcome measures
 ```
 
 **d) Scope**
+
+Use `AskUserQuestion` for the scope choice. Recommend the specific project when one is named.
+Otherwise recommend framework-wide scope. Use the prompt below only without the tool.
 
 ```
 Is this initiative scoped to:
@@ -261,7 +273,7 @@ if len(sorted_order) < len(milestones):
     # FAIL — print cycle, ask operator to resolve
 ```
 
-On cycle:
+On cycle, use `AskUserQuestion` for the three resolution types. Use the prompt below only without the tool:
 
 ```
 ⚠ Dependency cycle detected:
@@ -321,6 +333,30 @@ Append to the **Re-run history** table — one row per invocation:
 | YYYY-MM-DD | Initial creation — N milestones, scope=`{per-project / framework-wide}` |
 | YYYY-MM-DD | Added milestone "X"; filed M1, M2 as #123, #124 |
 
+### 6.5. Lint the rendered doc
+
+Run `lint.sh` against the file just written. The lint wraps the shared `_lib-mermaid-lint.sh` — it extracts the DAG's ` ```mermaid ` block and validates it via `mmdc` (mermaid-cli), so a broken block is caught at write time, not when a human opens the doc on GitHub. This block is a fresh process (per the per-block preamble rule above), so assign `output_path` explicitly to the same path resolved in step 2(d) / step 1 — do not reuse the variable name and leave it unset, or the lint call receives an empty path and exits 2:
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-read-config.sh"
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-portfolio-paths.sh"
+projects_dir=$(portfolio_projects_dir)
+SKILL_DIR="$(git rev-parse --show-toplevel)/.claude/skills/plan-initiative"
+# Assign the literal path resolved in step 2(d) / step 1, for example:
+#   scope 1 (project-scoped): output_path="$projects_dir/<project_name>/initiatives/<slug>.md"
+#   scope 2 (framework-wide): output_path="$projects_dir/initiatives/<slug>.md"
+output_path="<path resolved in step 2(d) or step 1>"
+"$SKILL_DIR/lint.sh" "$output_path" || lint_rc=$?
+```
+
+Handle the exit code before reporting the doc as written:
+
+- **Exit 0** — clean. Report `Mermaid lint: clean` alongside the output path.
+- **Exit 1** — parse error. Print the lint output; fix the offending DAG block (a classDef or edge slipped past substitution) and re-lint, or ask the operator whether to proceed with `--skip-lint`. Never report success on an unfixed failure.
+- **Exit 2** — bad input to the lint call, most often `output_path` unset or pointing at a missing file. Fix the path assignment above and re-lint; never report the doc as written while this persists.
+- **Exit 3** — `mmdc` / Node unavailable. Print the warning `Mermaid not validated: mmdc not available.` and report `Mermaid not validated: mmdc not available` alongside the output path — do not claim the diagram is clean.
+- **`--skip-lint`** (operator-requested) — report `Mermaid lint skipped`.
+
 ### 7. Show the rendered doc + confirm
 
 Print the resolved output path and the rendered doc inline. Ask:
@@ -366,22 +402,16 @@ Accept:
 
 #### Pass 1 — file each accepted milestone
 
-Write the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the `gh issue create` calls through (per AgDR-0030):
+Write the active-issue-skill marker as a defensive measure (per AgDR-0030). Note: since #709/#771 issue creation dispatches through the `tracker_create` **function**, invoked via command substitution — `result="$(tracker_create …)"` — which `require-skill-for-issue-create.sh` does not fire on (its matcher only anchors patterns at a command boundary, and a call wrapped in `$(…)` isn't one). So the marker is no longer the mechanism that permits the create; it's kept as a forward-compatible backstop — for robustness, and for any path that still shells out to a bare `gh issue create` at a command boundary:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "plan-initiative" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "plan-initiative" > "$skill_marker"
 ```
 
 For each accepted milestone (in topo-sorted order, so blocking milestones are filed before blocked ones), build the Feature-shape body conforming to `validate-issue-structure.sh`'s required sections:
@@ -407,22 +437,50 @@ _Source: /plan-initiative on YYYY-MM-DD — see `projects/<name>/initiatives/<sl
 
 Same source-link shape as `/handover` step 7.5 — plain prose path, no markdown link. The initiative doc lives in the ops fork (or private sibling), not in the target repo's URL space; a relative markdown link would be dead-on-render. See AgDR-0051 § Axis 3.
 
-File each via `gh issue create`:
+File each via `tracker_create` (#670 / AgDR-0072, extended by the #709 creator
+sweep) so milestones land in **this project's** tracker — GitHub, GitLab, or a
+`custom` CLI. For a GitHub adopter this runs `gh issue create` exactly as before.
 
 ```bash
-gh issue create --repo "$repo" \
-  --title "[Feature] {milestone-name}" \
-  --label "enhancement,${priority:-P2}" \
-  --body "$body"
+# Resolve + source the tracker lib ONCE, before the pass-1 loop, by walking up from cwd.
+tracker_lib="$(r="$PWD"; while [ -n "$r" ] && [ "$r" != / ]; do \
+  [ -f "$r/.claude/hooks/_lib-tracker.sh" ] && { echo "$r/.claude/hooks/_lib-tracker.sh"; break; }; \
+  r="${r%/*}"; done)"
+# shellcheck source=/dev/null
+. "$tracker_lib"
+
+# ── per milestone ────────────────────────────────────────────────────────────
+body_file="$(mktemp)"
+printf '%s\n' "$body" > "$body_file"
+# tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
+result="$(tracker_create "$repo" "[Feature] {milestone-name}" "$body_file" "enhancement,${priority:-P2}")"
+rc=$?
+rm -f "$body_file"
+if [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+  : # stop pass 1 — see failure handling below (rc=3 = tracker.kind=none: nothing filed)
+fi
+ref="$(printf '%s' "$result" | jq -r '.ref // empty')"
 ```
 
-Capture the returned issue number from `gh issue create`'s output (the URL contains it, or use `--json url -q '.url'`). Record `milestone_name → issue_number` in an in-memory map for pass 2.
+Capture the returned `ref` (from `tracker_create`'s normalised `{ref,url}` — no
+more URL-parsing). Record `milestone_name → ref` in an in-memory map for pass 2
+(the map now holds tracker references, so a non-numeric tracker key like `LIN-42`
+works unchanged — do not do arithmetic on it).
 
 On non-zero exit, stop pass 1 immediately. Use the same failure-handling shape as `/tickets-batch` § "Failure handling" (4 options: Retry, Skip, Edit, Abort; don't roll back filed tickets on abort).
 
 #### Pass 2 — add cross-references to each filed ticket
 
-Iterate over the just-filed set. For each filed milestone:
+Iterate over the just-filed set. For each filed milestone (`$issue_number` below
+is the tracker `ref` recorded in pass 1's map):
+
+> **Scope note (#709):** the pass-2 cross-ref edit uses `gh issue view` /
+> `gh issue edit` — issue *reads* and *body updates*, which are the read/update
+> axis, **not** creation. The #709 creator sweep converts only the creation call
+> (pass 1); the body-edit here stays on `gh` and is tracker-agnosticised
+> separately (read-side + update axis, tracked in #710 and the forge work). On a
+> non-GitHub project pass 1 files the milestones fine, but this cross-ref pass is
+> a no-op until that follow-up lands.
 
 1. Compute its inbound + outbound DAG edges restricted to the also-filed set.
 2. Build the cross-ref lines:
@@ -460,7 +518,10 @@ On any pass-2 failure: surface the error, name the affected milestone, continue 
 #### Remove the active-issue-skill marker on completion
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
 Always remove on every exit path (success, abort, error). The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers if the skill is interrupted, but a clean exit should never leave one behind.
@@ -485,7 +546,7 @@ Append a row to the **Re-run history** table:
 ```
 ✓ /plan-initiative q3-auth-rewrite complete.
 
-Output: projects/<name>/initiatives/q3-auth-rewrite.md
+Output: projects/<name>/initiatives/q3-auth-rewrite.md (Mermaid lint: clean)
 Milestones: 5 total (3 just filed: #123, #124, #125 — 2 still unfiled in the doc)
 
 Next:
@@ -505,8 +566,8 @@ Next:
 8. **Idempotence via filed-marker presence.** Re-runs partition milestones into "already filed" (silently skipped at filing step) vs "unfiled" (offered). Step 6's regeneration MUST preserve prior `Filed as [#N](url)` markers — match milestones across runs by name (case-insensitive, normalised whitespace). NOT byte-equivalence on the section (which would break under the post-filing rewrite). Same rule as `/handover` Rule 18.
 9. **Two-pass filing handles cross-refs.** Pass 1 files all accepted milestones (no cross-refs yet — issue numbers not yet known). Pass 2 iterates over the filed set, computes per-milestone cross-refs restricted to the also-filed subset, and rewrites each ticket's body via `gh issue edit`. Pass-2 failures don't abort — partial cross-refs are more useful than zero.
 10. **Source-link every filed ticket back to the initiative doc.** Each filed Feature ticket carries a `_Source: /plan-initiative on YYYY-MM-DD — see projects/<name>/initiatives/<slug>.md in the ops fork (...)_` footer in the body. Plain prose path, no markdown link — the initiative doc isn't in the target repo's URL space. Same shape as `/handover` step 7.5's source-link convention.
-11. **Active-issue-skill marker handling.** Write `plan-initiative` to `<ops_root>/.claude/session/active-issue-skill` before the first `gh issue create` in pass 1; remove on EVERY exit path (success, abort, error). Per AgDR-0030.
-12. **No bootstrap exemption needed.** The skill writes `*.md` (exempt from `require-active-ticket.sh`) and dispatches `gh` calls (gated separately by `require-skill-for-issue-create.sh`, satisfied by the active-issue-skill marker in step 8 pass 1). Don't add `plan-initiative` to `ticket.bootstrap_skills`.
+11. **Active-issue-skill marker handling (defensive).** Write `plan-initiative` to the path from `active_issue_skill_marker_path` before the first `tracker_create` in pass 1; remove on EVERY exit path (success, abort, error). Per AgDR-0030. Since #709/#771 issue creation runs through the `tracker_create` **function** via command substitution (`result="$(tracker_create …)"`), which `require-skill-for-issue-create.sh` doesn't fire on, the marker is a defensive backstop kept for robustness (and any path that still shells out to a bare `gh issue create` at a command boundary), not the mechanism that permits the create.
+12. **No bootstrap exemption needed.** The skill writes `*.md` (exempt from `require-active-ticket.sh`) and dispatches issue creation through the `tracker_create` **function** via command substitution, which since #709/#771 `require-skill-for-issue-create.sh` doesn't fire on (the active-issue-skill marker written in step 8 pass 1 is kept as a defensive backstop, not the thing that satisfies the gate). Don't add `plan-initiative` to `ticket.bootstrap_skills`.
 13. **Re-run history is append-only.** Each invocation adds one row to the table at the bottom of the doc. Don't truncate; long histories are evidence the initiative is being actively re-planned.
 14. **Out-of-scope items belong in the Anti-scope section.** When the operator names something during the interview as "we considered this but no", capture it in the doc's `## Anti-scope` block. Mirrors `templates/architecture/vision.md` § Anti-scope.
 15. **No auto-decomposition.** v1 deliberately does NOT take the initiative goal and emit N milestones from an LLM call. The Socratic interview shape is the contract; auto-decompose is a different product (and a worse one). See AgDR-0051 § Axis 1.
@@ -516,7 +577,7 @@ Next:
 - **Cross-initiative dependencies are out of scope for v1.** If Initiative A blocks Initiative B, capture that in prose in A's `## Anti-scope` or B's `## Goal` paragraph. v2 may add cross-initiative DAG semantics; v1 is one initiative at a time.
 - **Time/effort estimation is downstream.** The skill captures `confidence` in the operator's estimate, not the estimate itself. Estimation belongs in each milestone's filed Feature ticket via `/start-ticket` + the team's normal estimation flow.
 - **Resource allocation / role assignment is out of scope.** The framework's role-trigger machinery (per `.claude/rules/role-triggers.md`) handles who-picks-up-what once tickets are filed. `/plan-initiative` stops at the filing step.
-- **Mermaid renders, doesn't lint.** The skill outputs Mermaid `flowchart LR` blocks; doesn't run any Mermaid linter. If the operator wants to view the DAG outside GitHub's renderer, they pipe the block through `mmdc` themselves.
+- **Mermaid renders and lints.** The skill outputs Mermaid `flowchart LR` blocks and validates each one via step 6.5's `lint.sh` (the shared `_lib-mermaid-lint.sh`) before confirming the doc as written. Pass `--skip-lint` to bypass when `mmdc` is misbehaving.
 - **PDF export via `/pdf`.** The initiative doc is markdown; for stakeholder-share work, `/pdf projects/<name>/initiatives/<slug>.md` converts to PDF via the framework's standard converter dispatch.
 
 ## Related

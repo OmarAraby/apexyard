@@ -2,6 +2,13 @@
 # onboarding flag. Per-machine, per-clone. Never committed.
 .claude/session/
 
+# Transient per-agent git worktrees created by the Agent tool's
+# isolation:"worktree" mode. Each is a full linked working copy; leaving them
+# un-ignored makes the editor's language server re-index every copy (e.g. the
+# TS server flooding on adapter sources without their node_modules). Never
+# committed; auto-cleaned when the agent finishes unchanged.
+.claude/worktrees/
+
 # Real onboarding config (#517). The tracked template is onboarding.example.yaml;
 # /setup copies it to onboarding.yaml (this file) and fills in real values that
 # must stay LOCAL — company name, internal URLs, tracker instance, named people.
@@ -12,18 +19,38 @@ onboarding.yaml
 # sensitive-topic notes that should not leak to git — keep it local.
 .claude/project-config.json
 
+# Cognitive memory layer, Phase 0 (#692). The tracked templates are
+# MEMORY.example.md / USER.example.md; your real, accumulated notes live in
+# MEMORY.md / USER.md (this repo is typically a public fork opening PRs
+# upstream — real cross-project notes must stay LOCAL). Same example-file +
+# gitignore convention as onboarding.yaml above. db/ is reserved for a future
+# structured store and stays empty (via .gitkeep) in Phase 0 — no code reads
+# or writes here yet, but any future content there is per-clone too.
+.claude/memory/MEMORY.md
+.claude/memory/USER.md
+.claude/memory/db/*
+!.claude/memory/db/.gitkeep
+
 # Claude Code per-machine settings (permission overrides, local tool config)
 .claude/settings.local.json
 
 # Live working copies of managed projects. Each is its own git repo — they
 # must not be double-tracked from the ops repo.
-workspace/*/
+workspace/*
 !workspace/README.md
 
 # Adopter-specific agent routing (single-fork mode; split-portfolio mode
 # keeps this in the private repo). See docs/multi-project.md § "Centralised
 # agent routing" and docs/agdr/AgDR-0050-agent-runtime-overhaul.md.
 /agent-routing.yaml
+
+# Per-machine model-routing overrides — the local variant of the file above
+# (machine-specific model assignments). Adopter-local; never committed.
+/agent-routing.local.yaml
+
+# MCP server config — contains hardcoded local absolute paths; created per
+# adopter machine, must not be committed.
+/.mcp.json
 
 # Framework-defaults snapshot written by apply-agent-routing.sh on
 # SessionStart. The drift guard (block-agent-routing-drift.sh) reads it
@@ -39,8 +66,11 @@ workspace/*/
 
 # Backups of framework skills that were overridden by an adopter's
 # private custom skill (link-custom-skills.sh moves the framework version
-# aside as <skill-name>.framework.bak so the symlink can take its place).
+# to .claude/skill-framework-bak/<name>/ so it stays outside Cursor's
+# .claude/skills/ discovery root — AgDR-0187 / #1377). Legacy in-skills
+# *.framework.bak dirs are migrated on the next SessionStart.
 # These are per-machine artefacts; never committed.
+.claude/skill-framework-bak/
 .claude/skills/*.framework.bak/
 
 # Symlinks at .claude/skills/<name>/ created by link-custom-skills.sh

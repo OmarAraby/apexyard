@@ -6,6 +6,8 @@ argument-hint: "<feature or problem statement>"
 
 # /write-spec — Feature Specification
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 Write a feature specification or product requirements document (PRD).
 
 ## Activated role
@@ -60,6 +62,8 @@ template=$(portfolio_resolve_template prd.md)   # → custom-templates/prd.md if
 
 Single-fork adopters (no `portfolio` block) and adopters with no override fall straight through to `templates/prd.md`. Adopters who want a customised PRD shape drop their version at `<private_repo>/custom-templates/prd.md`. See `templates/README.md` for the path-mirroring convention.
 
+Read `.claude/rules/writing-standard.md` before drafting. Treat the resolved template as the source of truth: keep required sections, remove empty conditional sections, replace unknown required values with `TBD`, and delete the guidance comment before filing.
+
 The PRD should include:
 
 ```markdown
@@ -87,6 +91,8 @@ The PRD should include:
 ## Open Questions
 ## Timeline
 ```
+
+The list above is illustrative. Use the resolved template's Required and Conditional guidance. Do not add an empty conditional section only because it appears in this example.
 
 ### 5. Review and Iterate
 

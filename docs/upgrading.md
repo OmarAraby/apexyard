@@ -1,6 +1,6 @@
 # Upgrading Your ApexYard Fork
 
-`/update` is the single entry point for pulling new framework releases into your fork. As of v1.4.0 it walks the **per-version migration chain** — so a fork that's three releases behind runs three migrations in order, not just the latest one.
+`/update` is the single entry point for bringing framework releases into your fork. Since v1.4.0 it walks the **per-version migration chain**, so a fork that is three releases behind runs the three required migrations in order.
 
 This doc covers:
 
@@ -22,7 +22,7 @@ cd ~/ops/apexyard          # your fork
 /update                    # interactive sync — walks intermediate-release migrations
 ```
 
-That's it. On a fork that's three releases behind, `/update`:
+On a fork that is three releases behind, `/update`:
 
 1. Fetches `upstream/main`.
 2. Detects your current framework version from `.claude/framework-version` (or prompts you once if the file is missing).
@@ -31,7 +31,7 @@ That's it. On a fork that's three releases behind, `/update`:
 5. Stages all changes; you commit + push on a sync branch.
 6. Advances `.claude/framework-version` to the new latest tag.
 
-You're never more than one `/update` away from running every migration the framework needs you to run, even if you've been gone six months.
+One `/update` run can apply every migration required by the release gap, even after a long period without an upgrade.
 
 ---
 
@@ -41,15 +41,15 @@ You're never more than one `/update` away from running every migration the frame
 .claude/framework-version    # one line, e.g. "v1.4.0"
 ```
 
-This file records the framework version your fork was last synced against. `/update` reads it on entry, walks the chain to the new release tag, and writes the new value at the end. Forks created **before v1.4.0** don't have this file yet — `/update` will prompt you once to bootstrap it.
+This file records the framework version your fork last synced against. `/update` reads it, walks the chain to the new release tag, and writes the new value at the end. Forks created **before v1.4.0** do not have the file; `/update` prompts once to create it.
 
-The anchor is intentionally a separate file (not derived from git tags or merged into `project-config.json`) because:
+The anchor is a separate file rather than a value derived from git tags or stored in `project-config.json` because:
 
 - Adopters rewrite history routinely (squash-merge, rebase, `/update --rebase`). A derived signal would silently drift.
 - `project-config.json` mixes configured values with measured values; keeping the anchor separate lets each one have a single owner.
 - It's one line, one job — easy to read, easy to write, easy to debug.
 
-If you ever need to override it (rolled back a release, restored an older fork, accidentally deleted it):
+If you need to override it after a rollback, an older fork restore, or accidental deletion:
 
 ```bash
 /update --from-version v1.2.0
@@ -64,9 +64,29 @@ The override applies once. After a successful sync, the anchor is rewritten from
 | Migration | Adds / changes | Affects |
 |-----------|---------------|---------|
 | `v1.2.0-to-v1.3.0.sh` | Moves `onboarding.yaml` and `workspace/<name>/` from the public fork to the private sibling repo (split-portfolio v2). Writes the `.apexyard-fork` anchor. Adds the `portfolio.{onboarding,workspace_dir}` keys to `.claude/project-config.json`. Updates `.gitignore`. | Split-portfolio adopters on the v1 layout. No-op for single-fork adopters. |
-| `v1.3.0-to-v1.4.0.sh` | Currently a no-op placeholder. v1.4.0-cycle tickets that need per-adopter migrations (e.g. templates/tickets reorg) will populate the body before release-cut. | TBD when v1.4.0 ships. |
+| `v4.4.0-to-v5.0.0.sh` | No-op placeholder — v5.0.0's major bump carried no per-adopter file/config migration. Backfilled by #1105. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.0.0-to-v5.1.0.sh` | No-op placeholder. Backfilled by #1105. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.1.0-to-v5.2.0.sh` | No-op placeholder. Backfilled by #1105. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.2.0-to-v5.3.0.sh` | No-op placeholder. Backfilled by #1105. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.3.0-to-v5.4.0.sh` | **Real migration.** Untracks `.claude/project-config.json` (`git rm --cached`, working-tree file and its content preserved, untrack staged not committed) so the long-inert `.gitignore` entry finally applies. Closes the #1065 data-loss window: while the file was tracked, a plain `git checkout` could silently overwrite it and destroy a split-portfolio adopter's private `portfolio` block (never in git to restore from). Idempotent — no-op if the file is already untracked; defers to the operator (exit 1) rather than force past an unexpected staged state. | Every adopter whose fork still tracks `.claude/project-config.json` (anyone upgrading from ≤ v5.3.0). No-op once untracked. |
+| `v5.4.0-to-v5.5.0.sh` | No-op placeholder — v5.5.0 has no per-adopter file or configuration migration. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.5.0-to-v5.5.1.sh` | No-op placeholder — v5.5.1 has no per-adopter file or configuration migration. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.5.1-to-v5.5.2.sh` | No-op placeholder — v5.5.2 has no per-adopter file or configuration migration. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.5.2-to-v5.6.0.sh` | No-op placeholder. Backfilled by #1298 after v5.6.0 shipped with no pair script. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.6.0-to-v5.6.1.sh` | No-op placeholder. Backfilled by #1298 after v5.6.1 shipped with no pair script. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.6.1-to-v5.6.2.sh` | No-op placeholder. Backfilled by #1298 after v5.6.2 shipped with no pair script. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.6.2-to-v5.6.3.sh` | No file move. Prints the Cursor overlay reinstall commands. A leftover full `~/.cursor/hooks.json` can lock the IDE (AgDR-0151). | Cursor adopters who installed the old generated adapter. |
+| `v5.6.3-to-v5.7.0.sh` | No file move. Prints how to turn off the new behind-base check in `/approve-merge` (#1406) with `merge.require_up_to_date: false`. | Adopters who do not want `/approve-merge` to stop on a PR that is behind its base. |
+| `v5.7.0-to-v5.8.0.sh` | No file move. Reports unused `mcp_search` config keys left after the search MCP integration was removed (#1537), and notes that edits under `.claude/worktrees/` now need an active ticket (#1531). | Adopters who set `mcp_search`, or who edit files in agent worktrees. |
+| `v5.8.0-to-v5.9.0.sh` | No file move. Notes that `/start-ticket` writes a second marker into the git dir and that each linked worktree needs its own `/start-ticket` (#1576). Notes that the dispatcher and the ticket gate fail closed and need Claude Code 2.1.295 or later for `onFailure` (#1623). | Adopters who use linked worktrees, or who run Claude Code older than 2.1.295. |
+| `v5.9.0-to-v5.10.0.sh` | No-op placeholder. v5.10.0 has no per-adopter file or configuration migration. | Nobody (no-op); exists so the chain walks past this hop. |
+| `v5.10.0-to-v5.10.1.sh` | No-op placeholder. v5.10.1 has no per-adopter file or configuration migration. | Nobody (no-op); exists so the chain walks past this hop. |
 
 When a future release adds a migration, this table is the source of truth — the release PR template requires a row to be added here.
+
+> **Known residual gap (#1105).** The chain between `v1.3.0` and `v4.4.0` (roughly 15 releases, including the v2.x and v3.x majors) still has no migration scripts — same silent-skip failure this table's `v4.4.0`+ rows just fixed, just not backfilled yet. An adopter anchored in that range hits the same "chain refuses, anchor still advances" edge case described above. Backfilling it accurately means checking each release's actual changes rather than assuming no-op, so it's left as follow-up work rather than bundled into #1105's fix.
+>
+> Also note: `v1.3.0-to-v1.4.0.sh` no longer exists. `v1.4.0` was never tagged — v2.0.0 shipped in its place — so that script was an orphan pointing at a version the chain could never reach. It's been removed rather than renamed; see `.claude/migrations/README.md` § "Orphaned hop scripts" for why.
 
 ---
 
@@ -151,9 +171,9 @@ When you use `--from-dev` to pull from `upstream/dev`, the migration chain is au
 
 ## When `/update` isn't enough — re-forking & keeping your data
 
-Most of the time `/update` is all you need. The exception is when your fork has
-drifted so far that upgrading is a wall of conflicts — then you re-fork. Either
-way, the only thing you have to protect is **your own work**.
+Most of the time `/update` is enough. If the fork has drifted so far that the
+upgrade produces conflicts across most of the framework, re-fork it. In either
+case, protect **your own work**.
 
 One idea makes this easy: everything in your fork is either **the framework** or
 **your data**.
@@ -166,9 +186,9 @@ One idea makes this easy: everything in your fork is either **the framework** or
 
 ### Upgrade or re-fork?
 
-Run `/update --dry-run`. A clean or small merge → just `/update`. Conflicts
-across most of `.claude/` — or a PR from your fork to upstream that touches the
-*whole* framework tree → your base has drifted too far; re-fork.
+Run `/update --dry-run`. A clean or small merge means `/update` is enough.
+Conflicts across most of `.claude/`, or a fork PR that touches the whole
+framework tree, indicate that the base has drifted too far; re-fork it.
 
 ### Re-forking without losing anything
 

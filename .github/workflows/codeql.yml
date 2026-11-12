@@ -21,15 +21,32 @@ on:
   schedule:
     - cron: '27 3 * * 1'   # weekly, Monday 03:27 UTC
 
+# Least-privilege (#819 / Scorecard Token-Permissions #59): keep the
+# top-level block read-only. security-events:write is only granted at job
+# level below — Scorecard's topLevelPermissions probe flags any write scope
+# declared at workflow level, regardless of job-level scoping.
 permissions:
-  security-events: write
   actions: read
   contents: read
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Run only on the upstream repository (#1370). Code scanning is free for
+    # public repositories, but a private fork without GitHub Advanced Security
+    # cannot accept the SARIF upload: the analysis runs and the upload step
+    # fails with "Code scanning is not enabled for this repository". That
+    # leaves a check the adopter can never make green, and because
+    # block-merge-on-red-ci.sh blocks on any failing check, the framework's own
+    # workflow blocks the framework's own merge gate. scorecard.yml already
+    # carries this guard for the same reason.
+    if: github.repository == 'me2resh/apexyard'
     permissions:
       security-events: write   # required to upload CodeQL results
       actions: read
@@ -41,15 +58,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
         with:
           languages: ${{ matrix.language }}
           queries: security-extended
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
         with:
           category: "/language:${{ matrix.language }}"

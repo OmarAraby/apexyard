@@ -1,0 +1,129 @@
+# Right-Size Ceremony — Match the Gates to the Change
+
+The framework's SDLC gates exist to keep high-blast-radius work safe: a merge needs a review, a migration needs a rollback plan, a trust-chain edit needs the Security Auditor. That machinery is *correct* for the work it was built for. The failure mode is applying it **uniformly** — running the same review agents, role handoffs, and gate chain on a three-line `CODE_OF_CONDUCT.md` PR as on a schema migration. Uniform ceremony turns a batch of small changes into a gatekeeper queue (Rex → Tech Lead → Solution Architect → …) and burns tokens with nothing watching the disproportion.
+
+This rule is the **trigger heuristic** — the sibling of [`plan-mode.md`](plan-mode.md), [`parallel-work.md`](parallel-work.md), and [`loop-mode.md`](loop-mode.md). It tells you how to **right-size the ceremony to the change** instead of defaulting every change to the full chain. It does **not** relax any existing hard gate — it adds the missing **lean floor** for work that plainly doesn't need them.
+
+The same tiers govern **the work itself**, not only its review. Planning, implementation, and artifact creation take the same Lean / Standard / Heavy reading as the review chain — see "Proportionate work" below (me2resh/apexyard#1163).
+
+## The signals — how to tell what a change needs
+
+Score the change on three cheap signals you can read before touching it:
+
+| Signal | Read from | Low ← → High |
+|--------|-----------|--------------|
+| **Path class** | the file globs the framework already configures | docs/config-text (`.md`, `.txt`, issue templates) → ordinary code (`.py`, `.ts`) → **high-blast** (`.claude/hooks/**`, `.claude/settings.json`, `.githooks/**`, delegated gate runners such as `bin/run-pre-push-checks.sh`, `**/auth/**`, `**/crypto/**`, `**/secrets/**`, migrations, design artifacts, CI) |
+| **Blast radius** | diff size + reversibility | a few lines, revert-in-one-commit → a large diff, or an externally-visible / hard-to-reverse act (a released tag, a schema change, a message send) |
+| **Behavior surface** | does it change runtime behavior? | prose / comments only → touches code or tests → changes a security-critical control path |
+
+## The tiers
+
+The signals map to three tiers of ceremony:
+
+| Tier | What it is | Ceremony |
+|------|-----------|----------|
+| **Lean** | docs / comments / config-text, small, trivially reversible, no behavior change | **No role chain** — no design / security / architecture review sub-agents. One **lightweight Rex pass** (reduced-scope — see `.claude/agents/code-reviewer.md` § "Reduced-Scope Review") + the human merge nod. |
+| **Standard** | ordinary code changes | Rex (one review) + the human merge nod. Unchanged from today. |
+| **Heavy** | trust-chain, auth / crypto / secrets, migrations, design artifacts, large diffs, releases | The **full chain stays** — Rex + Security Auditor / Solution Architect / design review as the paths dictate. Unchanged from today. |
+
+The key realization: the framework **already detects every Heavy class** (the auto-fire triggers in [`role-triggers.md`](role-triggers.md), the migration gate, the architecture-review gate, the design gate). What was missing is the **Lean floor** — so everything not-Heavy was silently treated as Standard-full-ceremony. This rule adds only that floor.
+
+**Why Rex still runs at Lean (AgDR-0116).** The merge gate (`block-unreviewed-merge.sh`) requires a Rex approval marker on every PR, unconditionally, regardless of tier — it is a control that reads structured state (the marker's recorded SHA vs. the PR's HEAD as the forge reports it) and structurally cannot itself inspect a diff's content to decide a tier. Letting the gate skip the marker on a self-declared "Lean" attestation would mean trusting either a self-issued attestation or a path allowlist to gate a merge — both considered and rejected as new forgeable gate-relaxing surfaces (me2resh/apexyard#1064). So the Lean tier's ceremony reduction lives entirely in the **role chain** (Security Auditor / Solution Architect / UI Designer, suppressed) and in **Rex's own review depth** (reduced-scope) — never in whether a review happens at all.
+
+## Two safety rails (non-negotiable)
+
+A right-sizing heuristic is only safe if it fails in the harmless direction:
+
+1. **Security and trust-chain never go Lean.** Any change touching a production `.claude/hooks/*.sh` file, `.claude/settings.json`, `.githooks/**`, a delegated gate runner such as `bin/run-pre-push-checks.sh`, the merge-gate/marker libraries, auth, crypto, secrets, or a migration takes the Heavy path regardless of diff size. Test-only files under `.claude/hooks/tests/**` do not trigger Heavy by path alone; round up when the test changes enforcement semantics. A one-line production gate edit is exactly where you *want* the chain. This rail overrides the size signal every time.
+2. **Ambiguity rounds up.** If you're not sure which tier a change is, take the higher one. The tolerated failure is "occasionally too much review on a borderline case" — never "too little review on a risky one."
+
+## Scripted permission for Reduced-Scope review
+
+Before each Rex spawn or resume, follow `docs/skills/code-review-depth.md`.
+Run `bin/review-tier.sh` from the trusted base tree at the reviewed SHA over the full base..HEAD range.
+Never execute the PR's script. Missing scripts and all errors mean Full.
+The script allows only regular Markdown and raster images below `docs/`, except AgDRs, ORBIT records, and prompt-referenced paths.
+Its extensions are `.md`, `.png`, `.jpg`, `.jpeg`, `.gif`, and `.webp`.
+JSON, YAML, scripts, and lock files never qualify.
+Renames and copies include both paths. A truncated list means Full.
+`Reduced-scope-allowed` permits only the existing Reduced-Scope pass.
+Rex keeps both rails and can escalate on content. Use the stricter result.
+Recheck the forge head before dispatch and before accepting the review. Repeat after any push.
+This rule supersedes self-declared review eligibility, including the broader path examples above.
+Planning and implementation still use the proportionate-work guidance below.
+
+## One ticket per trust-chain PR (me2resh/apexyard#1418)
+
+A PR that touches any path rail 1 above names as trust-chain carries one ticket. Batching several tickets into one PR stays acceptable only for a Lean docs or config-text change — the same path class rail 1 already excludes from the trust chain.
+
+A trust-chain PR that batches several tickets makes each review round cost more: a reviewer cannot state one blocking finding against one criterion, because the PR carries several unrelated criteria at once, and a delta re-review (see `.claude/agents/code-reviewer.md` § "Delta Re-Reviews") cannot cleanly separate which ticket a later commit fixes. Splitting the PR by ticket keeps each review round scoped to one change.
+
+## When to apply this (proactively)
+
+Before spinning up review ceremony for a change, classify it:
+
+- **Lean** → Rex still runs (reduced-scope — a focused correctness read, not the full deep pass) and still writes the approval marker; take it straight to the merge nod afterward. What you skip is the **role chain** — don't spawn Security Auditor / Solution Architect / UI Designer for a docs-only, small, reversible change that doesn't independently trigger one of their own diff/path triggers.
+- **Standard** → the normal Rex + nod flow.
+- **Heavy** → the full chain, unchanged. Never shortcut it.
+
+And batch: N tiny independent Lean changes don't each need their own review pass — group the review, or merge them under one PR where the tracker model allows.
+
+## Proportionate work — the tiers apply before review, too
+
+Review ceremony is the last step of a task. The same disproportion shows up earlier: a plan with more steps than the change needs, an implementation that adds a helper module for one call site, a "quick assessment" that becomes a filed document. The tier you read for a change governs all four phases:
+
+| Phase | Lean | Standard | Heavy |
+|-------|------|----------|-------|
+| **Planning** | Act directly, or a one-line intent. No plan document. | A short plan in prose, or plan mode when [`plan-mode.md`](plan-mode.md) says so. | Plan mode; a technical design where the SDLC requires one. |
+| **Implementation** | The smallest edit that satisfies the acceptance criteria. Existing files and patterns only. | Smallest sufficient change. New code only where an existing pattern cannot carry it. | Full design first. New structure is expected, and each piece is justified in the design. |
+| **Artifact creation** | None beyond the change and its PR. Advice stays in conversation. | Only the artifacts a workflow gate or the ticket requires. | The full set the gates require — AgDR, design doc, migration record, runbook. |
+| **Review** | Reduced-scope Rex + the merge nod. | Rex + the merge nod. | The full chain. |
+
+Four working rules follow from the table. They are the same size-matching instinct as the review tiers, applied to what you build:
+
+1. **Start with the smallest change that satisfies the acceptance criteria.** Read the criteria, find the minimal edit that meets each one, and make that edit first. Extend it only when a criterion is still unmet, or when a reviewer asks. A larger change is not safer by default; it is a larger blast radius.
+2. **Reuse before you add.** Prefer an existing file, helper, pattern, dependency, or template over a new one. Extend the rule file that already owns a topic instead of adding a sibling. Use the library already in the manifest instead of adding another.
+3. **A new dependency, abstraction, service, or durable artifact needs a demonstrated need.** "Demonstrated" means you can name the criterion, gate, or concrete failure that the existing options cannot satisfy. If you cannot name it, do not add it. An abstraction with one caller, a service for one job, or a document nobody will read again is the usual sign.
+4. **Advice and quick assessments stay conversational.** A question deserves an answer in the thread, not a filed document. Create a durable artifact only when a workflow gate requires one (an AgDR for a material decision, a ticket to cross the tracker boundary, a design doc before Heavy Build) or when the operator asks for one.
+
+**The rails do not move.** Rule 1 through rule 4 reduce work, never safeguards. A change that touches security, the trust chain, or a migration is Heavy regardless of how small its diff is, and it gets every artifact and every review the Heavy path requires. When you cannot tell which tier the work is, round up (rail 2 above). "Smallest sufficient" is measured against the acceptance criteria and the Heavy safeguards together, never against the criteria alone.
+
+**What this rule does not say.** It does not say "write less code" as a goal in itself, and it does not say "skip the AgDR because the diff is small". A material decision (per [`agdr-decisions.md`](agdr-decisions.md)) is material at any diff size. It says: do not create structure, process, or documents that no criterion, gate, or reader needs.
+
+## The "watch" half — process cost vs change size
+
+The other half of the operator's ask ("something to watch the overengineering") is a **disproportion nudge**: when the *process* is about to cost more than the *work* — e.g. spawning a ~100k-token review for a 3-line doc PR, or opening a five-agent fan-out for three two-line edits — stop and take the Lean path instead.
+
+**The watch is your own judgment. There is no token meter in the open-source framework.** Earlier versions of this rule cited `enforce-budget.sh` as an existing hook that meters token cost — that was wrong: the hook is a **premium** component (gated on a `features.budget` entitlement) and is not tracked in this repository. Adopters running the OSS framework have no automatic disproportion signal; the nudge above is entirely self-discipline. Premium adopters do get the meter, and for them this rule is the judgment that reads it. See me2resh/apexyard#1044.
+
+## Self-check before spawning review ceremony
+
+```
+[ ] What tier is this change — Lean / Standard / Heavy? (path class + blast radius + behavior)
+[ ] If I'm about to spawn a role-chain sub-agent (Security Auditor / Solution Architect / UI Designer) beyond Rex, does the change actually warrant it, or is it Lean? (Rex itself always runs — the merge gate requires it unconditionally; see AgDR-0116.)
+[ ] Does it touch security / trust-chain / a migration? → Heavy, no exceptions (rail 1).
+[ ] Am I unsure of the tier? → round UP (rail 2).
+[ ] Is the process cost (agents, tokens, latency) proportionate to the change size?
+[ ] Is this the smallest change that meets every acceptance criterion, or did I add scope no criterion asks for?
+[ ] Did I reuse an existing file, pattern, or dependency before adding a new one?
+[ ] For each new dependency, abstraction, service, or durable artifact: can I name the criterion, gate, or failure that demanded it?
+[ ] Is this advice or a quick assessment that should stay in the conversation rather than become a filed document?
+```
+
+If you're spinning up the full chain for a change that's plainly Lean, you missed a right-sizing opportunity — the same class of miss as over-using `/fan-out` on trivial edits. If you added a module, a dependency, or a document that no criterion asked for, you made the same miss on the build side.
+
+## Backstop
+
+This rule is **primarily self-discipline** — the same shape as [`plan-mode.md`](plan-mode.md) and [`loop-mode.md`](loop-mode.md). Mechanical enforcement of the *Lean* floor isn't viable: a shell hook can't see "the agent is about to spawn a review sub-agent for a tiny change" — the `Agent`/`Task` spawn boundary has no `PreToolUse` matcher (see [AgDR-0056](../../docs/agdr/AgDR-0056-subagent-mcp-first.md)), the same reason `parallel-work.md` and `agent-role-selection.md` are self-discipline too. And a *blocking* tier-classifier would re-introduce the exact rigidity this rule exists to reduce — a mis-tier that hard-blocks is worse than the over-ceremony it replaces.
+
+So the enforcement split is deliberate: the **Heavy** classes keep their existing hard gates (merge gate, migration gate, architecture/design/security review — all unchanged); the **Lean** floor is agent judgment, with **no mechanical backstop in the OSS framework** (premium adopters additionally get `enforce-budget.sh`'s token meter — see the "watch" section above). Pair with feedback memory: if the operator says a change got "too much process" or "too much token burn," lean into this rule harder next time.
+
+Stating that plainly matters, because it changes how much weight the rule can carry. Every *other* rule in the self-discipline family (`plan-mode`, `parallel-work`, `loop-mode`) is honest that it has no enforcement. This one read as though it had a meter behind it, which made the Lean floor sound firmer than it is. It isn't — and if the recurring "too much process" feedback persists, that gap is the thing to close, not the prose.
+
+The cost of taking the Lean path on a change that turns out to need more is a follow-up review — cheap, and rail 2 makes it rare. The cost of running the full chain on every trivial change is the gatekeeper queue and token burn that prompted this rule.
+
+The "Proportionate work" section has the same enforcement shape. A hook can count files in a diff, but it cannot know whether a new module was needed or whether a question deserved a document. Regression cases for the build-side rules live at `docs/quality-regression/fixtures/proportionate-work-cases.md`; a static test pins that the rule, its wiring, and those cases stay present. It does not score model behavior — cross-harness evaluation is me2resh/apexyard#1165.
+
+---
+
+*Part of [ApexYard](https://github.com/me2resh/apexyard) — multi-project SDLC framework for Claude Code · MIT.*

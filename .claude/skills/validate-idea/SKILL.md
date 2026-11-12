@@ -5,6 +5,8 @@ argument-hint: "<IDEA-NNN | project-name | free-form description>"
 allowed-tools: Bash, Read, Write
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /validate-idea — Pre-spec validation gate
 
 A 10-minute, 5-question check before committing the time of `/write-spec`. Most ideas should die before the PRD round; this skill makes that decision explicit. Invokable standalone, and offered as an optional follow-up step inside `/idea` (after capture) and `/handover` (when the project looks dormant).
@@ -33,7 +35,7 @@ See `.claude/rules/role-triggers.md` for the activation protocol.
 
 ```
 /validate-idea IDEA-042              # validate a backlog entry by ID
-/validate-idea curios-dog            # validate a registered project (handover follow-up)
+/validate-idea sample-app            # validate a registered project (handover follow-up)
 /validate-idea AI-powered linter     # free-form description (no IDEA-NNN yet)
 ```
 

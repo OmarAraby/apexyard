@@ -44,51 +44,69 @@ fi
 
 # ---------------------------------------------------------------------------
 # 1. Extract --title, --body, --body-file, -F <path> from the command.
-#    Same parser shape as block-private-refs-in-public-repos.sh — lifted here
-#    to avoid creating a shared extractor library solely for one new caller.
+#    Quoted content flags come from _lib-flag-value.sh. Default trim `sub`
+#    and anchor `double` (`--<letter>` only) are this hook's previous parser.
 # ---------------------------------------------------------------------------
 
-extract_flag_value() {
-  # $1 = flag regex (e.g. --title | -t). Matches:
-  #   --title "value with spaces"
-  #   --title 'value with spaces'
-  #   --title value
-  #
-  # The original sed form used `[^"]*` which truncated at the first embedded
-  # double-quote inside the body value — false-blocking PRs whose body contained
-  # a `"` before the AgDR reference (me2resh/apexyard#461). The fix mirrors the
-  # already-corrected extractor in block-private-refs-in-public-repos.sh
-  # (me2resh/apexyard#227): awk with a greedy `(.*)` match anchored on the next
-  # recognised flag boundary (whitespace + `--<letter>`) or end-of-string. This
-  # captures the full quoted span, including any embedded quotes, without
-  # bleeding past the start of the next flag.
+flag_lib="$(dirname "$0")/_lib-flag-value.sh"
+if [ ! -r "$flag_lib" ]; then
+  echo "BLOCKED: _lib-flag-value.sh is missing. Cannot read PR flags." >&2
+  exit 2
+fi
+# shellcheck source=./_lib-flag-value.sh
+. "$flag_lib"
+
+# extract_path_flag FLAG_RE COMMAND  (me2resh/apexyard#1038)
+#
+# A PATH-valued flag needs the OPPOSITE parsing strategy to a CONTENT-valued
+# one, and conflating them is the actual defect behind #1038:
+#
+#   CONTENT (--title / --body): may contain anything — quotes, pipes,
+#     semicolons, markdown tables. Extraction must be GREEDY and terminate
+#     only on a real flag boundary, or an embedded quote truncates the value.
+#     The content parser in _lib-flag-value.sh is therefore left on the
+#     #227 trim (default `sub`) and the `--<letter>` anchor (default).
+#
+#   PATH (--body-file / -F): a filesystem path, which never contains a quote.
+#     Extraction must be NON-GREEDY — stop at the FIRST closing quote. The
+#     greedy content matcher cannot terminate `--body-file "/p/b.md" 2>&1 |
+#     tail`, so it fell through to the unquoted branch and returned the token
+#     WITH quotes attached. `[ -f ]` was then false, the body file was never
+#     read, and the `<!-- agdr: not-applicable -->` marker inside it was
+#     never seen — blocking the PR for a missing AgDR that WAS declared.
+#
+# An earlier attempt widened the content parser's anchor to accept shell
+# operators. That fixed the path case and broke the content case: `sub()` is
+# leftmost-first and each alternative ended in `.*`, so a body containing a
+# quote followed by ` |` truncated there. In the sibling leak hook that same
+# change was measurably WORSE than no fix at all (see #1039). Splitting the
+# extractors is the correct fix; widening the shared one is not.
+extract_path_flag() {
   local flag_re="$1"
   local cmd="$2"
   printf '%s' "$cmd" | awk -v FLAG_RE="$flag_re" -v SQ="'" '
     { buf = (NR == 1 ? $0 : buf "\n" $0) }
     END {
       s = buf
-      # Double-quoted value: greedy `(.*)` anchored on next flag or EOS.
-      re = "(" FLAG_RE ")[[:space:]]+\"(.*)\"([[:space:]]+--[a-zA-Z]|[[:space:]]*$)"
+      # Double-quoted path: stop at the first closing quote.
+      re = "(" FLAG_RE ")[[:space:]]+\"[^\"]*\""
       if (match(s, re)) {
         chunk = substr(s, RSTART, RLENGTH)
         sub("^(" FLAG_RE ")[[:space:]]+\"", "", chunk)
-        sub("\"([[:space:]]+--[a-zA-Z].*)?$", "", chunk)
-        sub("\"[[:space:]]*$", "", chunk)
+        sub("\"$", "", chunk)
         print chunk
         exit
       }
-      # Single-quoted value: same greedy + anchor treatment.
-      re = "(" FLAG_RE ")[[:space:]]+" SQ "(.*)" SQ "([[:space:]]+--[a-zA-Z]|[[:space:]]*$)"
+      # Single-quoted path: same treatment.
+      re = "(" FLAG_RE ")[[:space:]]+" SQ "[^" SQ "]*" SQ
       if (match(s, re)) {
         chunk = substr(s, RSTART, RLENGTH)
         sub("^(" FLAG_RE ")[[:space:]]+" SQ, "", chunk)
-        sub(SQ "([[:space:]]+--[a-zA-Z].*)?$", "", chunk)
-        sub(SQ "[[:space:]]*$", "", chunk)
+        sub(SQ "$", "", chunk)
         print chunk
         exit
       }
-      # Unquoted value: single token, embedded quotes irrelevant.
+      # Unquoted path: a single whitespace-delimited token.
       re = "(" FLAG_RE ")[[:space:]]+[^[:space:]]+"
       if (match(s, re)) {
         chunk = substr(s, RSTART, RLENGTH)
@@ -105,7 +123,8 @@ BODY=$(extract_flag_value '--body|-b' "$COMMAND")
 
 # --body-file <path> / -F <path> (only when -F's value is NOT a key=val pair,
 # because `gh api -F body=@file` uses the same flag letter).
-BODY_FILE=$(extract_flag_value '--body-file' "$COMMAND")
+# #1038: a PATH, so use the non-greedy path extractor.
+BODY_FILE=$(extract_path_flag '--body-file' "$COMMAND")
 if [ -z "$BODY_FILE" ]; then
   F_VAL=$(echo "$COMMAND" | sed -nE "s/.*(^|[[:space:]])-F[[:space:]]+\"([^\"]*)\".*/\2/p" | head -1)
   if [ -z "$F_VAL" ]; then
@@ -124,9 +143,21 @@ if [ -n "$BODY_FILE" ] && [ -f "$BODY_FILE" ]; then
   BODY_FILE_CONTENT=$(cat "$BODY_FILE" 2>/dev/null)
 fi
 
-# Build the body haystack. Title is included so an AgDR reference in the
-# title also satisfies the requirement (reviewers will see it either way).
-HAYSTACK=$(printf '%s\n%s\n%s\n' "$TITLE" "$BODY" "$BODY_FILE_CONTENT")
+# Build the body haystack. Title is included so an AgDR reference in the title
+# also satisfies the requirement (reviewers will see it either way).
+#
+# The RAW COMMAND is included too (#769 bug 2): the --body extractor cannot
+# reliably recover a value that spans newlines (a `--body "$(cat <<'EOF' … EOF)"`
+# heredoc — awk's `.` doesn't cross lines) or is followed by a shell operator
+# (`… )" 2>&1 | tail` — the closing-quote anchor doesn't match a trailing
+# redirect/pipe). In both shapes BODY comes back as a stub like `"$(cat`, so the
+# skip marker and any AgDR reference INSIDE the body were missed and the PR was
+# false-blocked. The inline body is always a substring of $COMMAND, so grepping
+# the command directly makes the marker + AgDR-ref checks robust to every
+# quoting shape. (--body-file bodies live in a file, handled above; the marker
+# there is a distinctive HTML comment, so a raw-command match is not a false
+# bypass risk.)
+HAYSTACK=$(printf '%s\n%s\n%s\n%s\n' "$TITLE" "$BODY" "$BODY_FILE_CONTENT" "$COMMAND")
 
 # ---------------------------------------------------------------------------
 # 2. Skip marker short-circuit.
@@ -247,6 +278,26 @@ fi
 # Code review (Rex) and the security auditor still apply — exemptions are
 # surgical, not blanket. See .claude/rules/workflow-gates.md § Spike work.
 # ---------------------------------------------------------------------------
+# True when the marker that governs REPO_ROOT names a [Spike] or [Prototype]
+# ticket: the marker in its tree's git dir, else the old-layout marker for
+# that path. A spike in one project cannot exempt a change in another project
+# or tree.
+spike_marker_exempt() {
+  local hook_dir
+  hook_dir="$(cd "$(dirname "$0")" && pwd)"
+  [ -n "${REPO_ROOT:-}" ] && [ -f "$hook_dir/_lib-active-ticket.sh" ] || return 1
+  # shellcheck source=/dev/null
+  . "$hook_dir/_lib-active-ticket.sh"
+  # Without an ops root, the old-layout markers under REPO_ROOT still count.
+  active_ticket_init "$REPO_ROOT" || active_ticket_set_context "" "" "$REPO_ROOT"
+  active_ticket_lookup "$REPO_ROOT" || return 1
+  active_ticket_read_field "$REPLY" title || return 1
+  case "$REPLY" in
+    '[Spike]'*|'[Prototype]'*) return 0 ;;
+  esac
+  return 1
+}
+
 spike_pr_exempt() {
   # (a) spike(...) PR title. Prototype work (apexyard#673) is throw-away
   # UX/demo exploration and shares the spike exemption: `prototype(...)` PR
@@ -255,46 +306,9 @@ spike_pr_exempt() {
     return 0
   fi
 
-  # (b) active ticket marker has [Spike] or [Prototype] prefix
-  local marker_home="${REPO_ROOT}"
-  # Walk up to find the ops root. Honours both the v2 `.apexyard-fork`
-  # marker and the legacy v1 anchor (onboarding.yaml + apexyard.projects.yaml).
-  local hook_dir
-  hook_dir="$(cd "$(dirname "$0")" && pwd)"
-  if [ -f "$hook_dir/_lib-ops-root.sh" ]; then
-    # shellcheck source=/dev/null
-    . "$hook_dir/_lib-ops-root.sh"
-    local resolved
-    resolved=$(resolve_ops_root "$REPO_ROOT")
-    [ -n "$resolved" ] && marker_home="$resolved"
-  else
-    local r="$REPO_ROOT"
-    while [ -n "$r" ] && [ "$r" != "/" ]; do
-      if [ -f "$r/.apexyard-fork" ]; then
-        marker_home="$r"
-        break
-      fi
-      if [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; then
-        marker_home="$r"
-        break
-      fi
-      parent=$(dirname "$r"); [ "$parent" = "$r" ] && break; r="$parent"
-    done
-  fi
-
-  if [ -f "$marker_home/.claude/session/current-ticket" ]; then
-    if grep -qE '^title=\[(Spike|Prototype)\]' "$marker_home/.claude/session/current-ticket" 2>/dev/null; then
-      return 0
-    fi
-  fi
-  if [ -d "$marker_home/.claude/session/tickets" ]; then
-    for marker in "$marker_home/.claude/session/tickets"/*; do
-      [ -f "$marker" ] || continue
-      if grep -qE '^title=\[(Spike|Prototype)\]' "$marker" 2>/dev/null; then
-        return 0
-      fi
-    done
-  fi
+  # (b) the marker of the PR repo's working tree names a [Spike] or
+  # [Prototype] ticket
+  spike_marker_exempt && return 0
 
   # (c) branch named spike/... or prototype/...
   local branch
@@ -333,8 +347,15 @@ resolve_ref() {
 }
 
 if [ -n "$BASE_ARG" ]; then
-  # Try upstream/<arg>, origin/<arg>, <arg> in that order.
-  for candidate in "upstream/$BASE_ARG" "origin/$BASE_ARG" "$BASE_ARG"; do
+  # Try origin/<arg>, upstream/<arg>, <arg> in that order (#769 bug 1).
+  # origin/<arg> FIRST: a same-repo `--base main` PR merges into the fork's OWN
+  # base (origin/main), so that is the correct diff base. Trying upstream/<arg>
+  # first meant that on a fork whose main is behind upstream (the normal state
+  # before /update), the merge-base was computed against upstream's newer tree,
+  # so every file upstream changed since the last sync surfaced as an
+  # "architecture change" in this PR — false-blocking docs-only PRs. upstream
+  # stays as a fallback for a fresh fork whose origin lacks the base ref.
+  for candidate in "origin/$BASE_ARG" "upstream/$BASE_ARG" "$BASE_ARG"; do
     r=$(resolve_ref "$candidate")
     if [ -n "$r" ]; then BASE_REF="$r"; break; fi
   done
@@ -573,11 +594,14 @@ fi
   cat <<'MSG'
 
 Why this is blocked:
-  .claude/rules/agdr-decisions.md calls /decide a HARD STOP before any
-  technical decision — library choice, architecture move, new dependency,
-  infra shape. Other HARD STOPs in the ruleset (merge approval, ticket-
-  first, migration-first) are mechanically enforced at PR time; this one
-  closes the gap.
+  .claude/rules/agdr-decisions.md § "The threshold" calls /decide a HARD
+  STOP before any MATERIAL technical decision — a new dependency/technology,
+  a new service/integration, a data-model or schema change, a security-
+  relevant control, CI/CD or infra design, a repo-wide pattern, or anything
+  hard to reverse. This PR's diff matched one of the trigger paths/dep-file
+  patterns below, which are a conservative proxy for that bar. Other HARD
+  STOPs in the ruleset (merge approval, ticket-first, migration-first) are
+  mechanically enforced at PR time; this one closes the gap.
 
 To unblock:
   1. Run /decide to walk through the decision and generate an AgDR file

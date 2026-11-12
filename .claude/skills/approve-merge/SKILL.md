@@ -1,40 +1,42 @@
 ---
 name: approve-merge
 description: Record per-PR CEO approval and merge in one turn. ONLY on an explicit per-PR "approved" — never on umbrella "go".
-disable-model-invocation: false
+disable-model-invocation: true
 argument-hint: "<pr-number> [--no-merge]"
 effort: low
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /approve-merge — Record CEO Approval and Merge
 
-Writes a structured marker at `.claude/session/reviews/<owner>__<repo>__<pr>-ceo.approved` (repo-qualified path, see AgDR-0060), then runs `gh pr merge <pr> --squash --delete-branch` in the same turn. The marker contains required key/value fields (not just a bare SHA) so a raw `echo SHA > file` from the model is mechanically rejected by `block-unreviewed-merge.sh`.
-
-This is the **mechanical enforcement** of the "plan-level 'go' is not merge approval" rule in `.claude/rules/pr-workflow.md`. The load-bearing semantic is "every merge needs an explicit per-PR approval", **not** "every merge needs two user messages."
+Write per-PR approval, then merge through the tracker adapter.
+Rationale: read docs/skills/approve-merge-rationale.md for gate history and AgDR references.
 
 ## The one rule you must not break
 
-**INVOKE THIS SKILL ONLY ON EXPLICIT, PER-PR, USER-NAMED MERGE APPROVAL.**
+Invoke only on explicit user approval for this PR. A plan-level "go" is not merge approval.
+Stop and ask when the PR or intent is unclear. Only the human can invoke this skill (#1042).
 
-The valid invocation triggers look like this:
+## Menu path
 
-- "approved" / "approve" / "merge" / "merge it" / "ship it" / "go ahead and merge" — **if and only if** the surrounding context clearly names a specific PR and the PR being asked about is known.
-- "PR #42 is approved" / "yes, merge #42" / "ship #42" — names the PR.
-- A reply to your own "Ready to merge PR #42 — approved?" message that consists of any affirmative token — because you just named the PR and the user is responding to that specific question.
-
-**Invalid triggers** (do NOT run this skill):
-
-- "go" / "continue" / "proceed" / "execute the plan" / "ship it" — **when these are said in response to a plan that happens to include a merge step but is not specifically about the merge**. This is the exact failure mode this skill exists to prevent. See the example in `.claude/rules/pr-workflow.md` § "Plan-level 'go' is NOT merge approval".
-- "yes" / "ok" / "sure" — if you cannot point at a specific "Ready to merge PR #X?" question in the last two turns of conversation, these are too ambiguous.
-- Your own inference that "the user probably wants the merge now because they said 'go' on the plan." NO. Stop and ask explicitly.
-
-**If in doubt: STOP AND ASK.** The cost of one extra "PR #X ready — approved?" question is one message. The cost of a wrong merge is real work to revert.
-
-The fact that this skill now runs the merge as part of its default flow does **not** weaken this rule — it sharpens it. The invocation moment IS the merge moment; you don't get a free second-message safety net to rethink. Invoke only when you're certain.
+The operator can also approve from one `AskUserQuestion` menu. Ask exactly `Approve and merge <owner>/<repo>#<N> at <40-hex-sha>?` with options `Approve and merge` and `Not yet` only. A hook writes the record; never write it yourself. See AgDR-0234.
 
 ## Process
 
-### 1. Parse the PR number and flags
+### 0. Resolve the configured approver display title (SOFT, prose-only)
+
+Before addressing the user in any confirmation question or report, read the configured display title for the human per-PR merge approver:
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-read-config.sh"
+APPROVER_TITLE=$(config_get_or '.review_markers.human_approver_title' 'CEO')
+```
+
+Use `$APPROVER_TITLE` in prose only. Keep the `-ceo` filename and marker fields unchanged.
+If config or jq is unavailable, use `CEO`. This display setting must not block the skill.
+
+### 1. Parse the PR number, the repo, and flags
 
 Extract the PR number from `$ARGUMENTS`. If no number is given, try to infer from:
 
@@ -43,44 +45,24 @@ Extract the PR number from `$ARGUMENTS`. If no number is given, try to infer fro
 
 If the PR number is ambiguous (multiple PRs on the branch, unclear which was approved), STOP and ask the user which PR.
 
-Recognise the optional `--no-merge` flag. When present, the skill writes the marker but does NOT run the merge. Useful for the rare cases below — see § "Notes" for when to use it.
+Resolve `REPO` from `owner/repo#N` or an explicit `owner/repo` argument.
+Otherwise, parse the current checkout's `git remote get-url origin`. Do not use ambient gh resolution or `headRepository` (#887).
+Scope each host query to `REPO`, then `PR_HOST_REPO` after step 4.
+Recognise `--no-merge`. It writes approval without merging.
 
 ### 2. Sanity-check the user's intent
 
-Before doing anything, re-read the user's most recent message:
+Re-read the latest message and apply the one rule above.
+Treat a reply to your "Ready to merge PR #X — approved?" question as naming this PR.
+Stop on an umbrella "go" and ask:
+> "PR #X is ready to merge. Just confirming — explicit approval to merge PR #X, now?"
+Proceed only after an unambiguous per-PR approval.
 
-- Did the user explicitly name this PR, or can I point at a direct "Ready to merge PR #X — approved?" question from me that they are responding to?
-- Is the user's message a standalone merge nod, or is it an umbrella "go" on a broader plan?
-- If the latter — **STOP**. Reply with a per-PR explicit question instead:
-  > "PR #X is ready to merge. Just confirming — explicit approval to merge PR #X, now?"
+### 3. Resolve the ops root
 
-Only proceed past this step if the user has given an unambiguous per-PR approval.
-
-### 3. Verify the PR state
-
-```bash
-gh pr view <pr> --repo <owner/repo> --json state,isDraft,mergeable,headRefOid
-```
-
-Sanity checks:
-
-- `state` must be `OPEN`. Refuse if it's `MERGED`, `CLOSED`, or `DRAFT`.
-- `mergeable` should be `MERGEABLE` or `UNKNOWN` (GitHub hasn't computed yet). Refuse on `CONFLICTING`.
-- Capture `headRefOid` — this is the **PR's HEAD on GitHub**, which is the SHA both markers must match. Don't use `git rev-parse HEAD` from the local working tree — it's rarely the PR branch and the merge gate compares against the GitHub-reported HEAD.
-
-### 4. Verify the Rex marker exists at the PR's HEAD
-
-The CEO approval is a stamp on top of a Rex-approved HEAD, not a standalone action.
+Keep this bootstrap inline. It locates the script from workspace clones and split-portfolio forks (#229, #230, #559).
 
 ```bash
-# Resolve the OPS FORK ROOT, not git toplevel. Inside workspace/<project>/,
-# git toplevel is the project clone; markers live in the ops fork above.
-# See me2resh/apexyard#229 + #230. Resolve PIN-FIRST — the same strategy the
-# merge gate uses (_lib-ops-root.sh::resolve_ops_root). The session pin points
-# at the real ops fork even from a workspace clone; a plain walk-up resolves to
-# the private portfolio sibling in split-portfolio mode (it has onboarding.yaml
-# + apexyard.projects.yaml) where _lib-review-markers.sh doesn't exist, so the
-# CEO marker lands where the gate can't see it (me2resh/apexyard#559).
 OPS_ROOT=""
 PIN_FILE="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"
 if [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ -f "$PIN_FILE" ]; then
@@ -102,16 +84,50 @@ if [ -z "$OPS_ROOT" ]; then
   done
 fi
 MARKER_HOME="${OPS_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
-
-# Source the marker path helper — repo-qualified naming (#485, AgDR-0060).
-# shellcheck source=/dev/null
-. "$MARKER_HOME/.claude/hooks/_lib-review-markers.sh"
-PR_REPO=$(gh pr view <pr> --json headRepository --jq '.headRepository.nameWithOwner' 2>/dev/null)
-REX=$(review_marker_path "$PR_REPO" <pr> rex "$MARKER_HOME")
-[ -f "$REX" ] && [ "$(tr -d '[:space:]' < "$REX")" = "<headRefOid from step 3>" ]
 ```
 
-If Rex's marker is missing or its SHA doesn't match the PR HEAD, refuse and tell the user to re-invoke the code-reviewer first. Do not write the CEO marker on a stale base.
+### 4. Check merge prerequisites once
+
+Run this command once. Capture stdout. Show stderr to the user.
+
+```bash
+CHECK_JSON=$(bash "$MARKER_HOME/.claude/skills/approve-merge/scripts/approve-merge.sh" <pr> "$REPO" "$MARKER_HOME")
+CHECK_RC=$?
+[ "$CHECK_RC" -eq 0 ] || exit "$CHECK_RC"
+printf '%s' "$CHECK_JSON" | jq -e '
+  type == "object" and
+  (.marker_home | type == "string" and length > 0) and
+  (.pr_host_repo | type == "string" and length > 0) and
+  (.strategy | type == "string" and length > 0) and
+  (.head_sha | type == "string" and length > 0) and
+  (.release_class | type == "boolean")' >/dev/null || exit 1
+MARKER_HOME=$(printf '%s' "$CHECK_JSON" | jq -r '.marker_home') || exit 1
+PR_HOST_REPO=$(printf '%s' "$CHECK_JSON" | jq -r '.pr_host_repo') || exit 1
+MERGE_STRATEGY=$(printf '%s' "$CHECK_JSON" | jq -r '.strategy') || exit 1
+RELEASE_CLASS=$(printf '%s' "$CHECK_JSON" | jq -r '.release_class') || exit 1
+case "$MERGE_STRATEGY" in
+  squash|merge|rebase) ;;
+  *) echo "Invalid merge strategy." >&2; exit 1 ;;
+esac
+source "$MARKER_HOME/.claude/hooks/_lib-review-markers.sh" || exit 1
+CHECK_SHA=$(printf '%s' "$CHECK_JSON" | jq -r '.head_sha') || exit 1
+HEAD_SHA=$(gh pr view <pr> --repo "$PR_HOST_REPO" --json headRefOid -q '.headRefOid') || exit 1
+[ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" = "$CHECK_SHA" ] || { echo "PR head changed after the check." >&2; exit 1; }
+```
+
+Stop on any non-zero exit, invalid JSON, or missing field. NEVER assume a pass.
+Accept only squash, merge, rebase as strategy values.
+
+- Exit 10: the branch is behind and the base touches shared files. Tell the user to update the branch.
+  Show `gh pr update-branch <pr> --repo "$REPO"`. Wait for green CI. Run the carry-over check before requesting a Rex delta review.
+  Use `AskUserQuestion` with "Run it yourself (Recommended)" and "Approve me to run it".
+  The first choice means the operator runs the command. The second permits the agent to push the branch update.
+  Update nothing before the operator chooses. If the harness lacks this tool, show the same choices as a numbered list.
+- Exit 11: the behind check could not run. Retry or verify the base manually. Stop before writing any marker.
+- Exit 12: the Rex marker is missing or stale. Never move, rename, or copy a marker file.
+  Use `rm` to delete the gate-invisible file named in stderr. Re-run `/code-review <pr>` without a marker path.
+- Exit 13: the release PR title or body is unreadable. Fix the read failure and retry. Never use a bare squash fallback.
+- Other exit: show the error and stop.
 
 ### 5. Write the structured CEO marker
 
@@ -125,34 +141,22 @@ skill_version=2
 approval_summary="<truncated user approval message, ≤200 chars>"
 ```
 
-Required fields the merge gate verifies:
-
-| Field | Why |
-|-------|-----|
-| `sha=<HEAD>` | Binds the approval to a specific commit. SHA must match the PR's GitHub HEAD. |
-| `approved_by=user` | Marker that distinguishes a skill-written marker from a model-fabricated raw `echo SHA > file`. |
-| `skill_version=2` (or higher) | Format version. Bare-SHA legacy markers (no `skill_version=`) are rejected by the new gate. Version bump signals a behaviour change to anyone reading the file. |
-
-Optional fields the gate stores but doesn't validate:
-
-| Field | Use |
-|-------|-----|
-| `approved_at=<ISO>` | Audit-log timestamp. Helpful when reviewing past merges. |
-| `approval_summary=<text>` | First ≤200 chars of the user's approval message, sanitised (no shell metachars). Audit trail for "what did the user say when they approved this." |
-
-Use the **ops fork root** as the path anchor (NOT git toplevel — see #229 + #230 for the workspace-clone bug this avoids). Reuse the same MARKER_HOME and the `_lib-review-markers.sh` helper (already sourced in step 4):
+Keep all marker fields below. Use the ops root and the repo-qualified `review_marker_path` helper (AgDR-0060, #765).
+`HEAD_SHA` is the script's `head_sha`, confirmed by a fresh read in step 4.
 
 ```bash
-# (MARKER_HOME and PR_REPO already resolved in step 4 — reuse them here.)
+# (MARKER_HOME and PR_HOST_REPO already resolved in step 4 — reuse them here.)
 mkdir -p "$MARKER_HOME/.claude/session/reviews"
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # Sanitise: drop newlines, drop shell-special chars, truncate to 200.
 summary=$(echo "<user approval message>" | tr '\n' ' ' | tr -d '"`$\\' | cut -c1-200)
 
-CEO=$(review_marker_path "$PR_REPO" <pr> ceo "$MARKER_HOME")
+# CEO marker keyed on the BASE repo — same key as Rex's marker and the gate's
+# lookup (#765). Keying it on the fork would leave a cross-fork merge blocked.
+CEO=$(review_marker_path "$PR_HOST_REPO" <pr> ceo "$MARKER_HOME")
 cat > "$CEO" <<EOF
-sha=<headRefOid>
+sha=${HEAD_SHA}
 approved_by=user
 approved_at=${ts}
 skill_version=2
@@ -160,43 +164,55 @@ approval_summary="${summary}"
 EOF
 ```
 
-### 6. Determine merge strategy
+### 6. Merge with the checked strategy
 
-Before running the merge, check whether this is a **sync-class PR**. A PR is sync-class if either:
-
-- Its head branch matches `sync/main-to-dev-after-*` (the canonical `/release-sync` branch prefix), OR
-- Its PR title starts with `sync(` (the canonical `/release-sync` PR title prefix)
+Skip this step for `--no-merge`. Run this entire block in one shell.
+Shell variables from step 4 do not carry over. The block re-runs the script and stops on a missing or invalid strategy or release_class (#1196). Fill in `<marker_home>`, `<repo>` and `<pr>` with literal values.
+Pass those same `<repo>` and `<pr>` literals to tracker_pr_merge. The merge gate reads the command text before the shell expands variables (#1758).
+The block stops when the checked host repo is not `<repo>`.
+The tracker_pr_merge call MUST be invoked as a bare top-level statement, never inside `$(...)` or backticks. The merge-gate matcher reads the raw command text and may not fire on a wrapped call. Redirect stdout to a file, then read the result in a separate step.
 
 ```bash
-PR_HEAD_BRANCH=$(gh pr view <pr> --repo <owner/repo> --json headRefName -q '.headRefName' 2>/dev/null)
-PR_TITLE=$(gh pr view <pr> --repo <owner/repo> --json title -q '.title' 2>/dev/null)
-
-MERGE_STRATEGY="--squash"  # default for all other PRs
-if echo "$PR_HEAD_BRANCH" | grep -qE '^sync/main-to-dev-after-' || \
-   echo "$PR_TITLE" | grep -qE '^sync\('; then
-  MERGE_STRATEGY="--merge"
+MARKER_HOME="<marker_home>"
+CHECK_JSON=$(bash "$MARKER_HOME/.claude/skills/approve-merge/scripts/approve-merge.sh" <pr> "<repo>" "$MARKER_HOME") || exit 1
+PR_HOST_REPO=$(printf '%s' "$CHECK_JSON" | jq -r '.pr_host_repo | tostring') || exit 1
+MERGE_STRATEGY=$(printf '%s' "$CHECK_JSON" | jq -r '.strategy | tostring') || exit 1
+RELEASE_CLASS=$(printf '%s' "$CHECK_JSON" | jq -r '.release_class | tostring') || exit 1
+[ -n "$PR_HOST_REPO" ] && [ "$PR_HOST_REPO" != null ] || exit 1
+case "$MERGE_STRATEGY" in squash|merge|rebase) ;; *) echo "Invalid strategy." >&2; exit 1 ;; esac
+case "$RELEASE_CLASS" in true|false) ;; *) echo "Invalid release_class." >&2; exit 1 ;; esac
+[ "$PR_HOST_REPO" = "<repo>" ] || { echo "Checked host repo does not match <repo>." >&2; exit 1; }
+source "$MARKER_HOME/.claude/hooks/_lib-tracker.sh" || exit 1
+RELEASE_SUBJECT=""
+RELEASE_BODY_FILE=""
+if [ "$RELEASE_CLASS" = true ]; then
+  RELEASE_SUBJECT=$(gh pr view <pr> --repo "$PR_HOST_REPO" --json title -q '.title') || exit 1
+  if [ -z "$RELEASE_SUBJECT" ]; then
+    echo "ERROR: could not read the release PR's title." >&2
+    exit 1
+  fi
+  RELEASE_BODY_FILE=$(mktemp) || exit 1
+  if ! gh pr view <pr> --repo "$PR_HOST_REPO" --json body -q '.body' > "$RELEASE_BODY_FILE" \
+     || [ ! -s "$RELEASE_BODY_FILE" ]; then
+    echo "ERROR: could not read the release PR's body. Refusing a bare squash." >&2
+    rm -f "$RELEASE_BODY_FILE"
+    exit 1
+  fi
 fi
+MERGE_RESULT_FILE=$(mktemp) || exit 1
+tracker_pr_merge "<repo>" "<pr>" "${MERGE_STRATEGY}" true "$RELEASE_SUBJECT" "$RELEASE_BODY_FILE" > "$MERGE_RESULT_FILE"
+MERGE_RC=$?
+MERGE_RESULT="$(cat "$MERGE_RESULT_FILE")"
+MERGE_SHA=$(printf '%s' "$MERGE_RESULT" | jq -r '.sha // empty' 2>/dev/null)
+rm -f "$MERGE_RESULT_FILE" "$RELEASE_BODY_FILE"
 ```
 
-**Why auto-detect instead of a flag:** a `--merge-strategy` flag would require the operator to remember to pass it on every sync PR merge. Sync PRs squashed silently — the v2.2.0 incident — show that operator ceremony is not a reliable safeguard. Auto-detection makes the correct behaviour the default; an operator who wants to override can do so via the CLI directly. See `AgDR-0053`.
+### 7. Process the merge result
 
-**Why `--merge` for sync PRs:** the sync branch's top commit is a true two-parent merge commit (branch = dev, second parent = main's release squash). That two-parent relationship is the ancestry link that makes future `dev → main` release PRs conflict-free. Squash-merging discards the second parent permanently, defeating the skill's entire purpose. See `AgDR-0053`.
-
-### 7. Run the merge — DEFAULT FLOW
-
-Unless `--no-merge` was passed, run the merge in the same turn using the strategy determined in step 6:
-
-```bash
-gh pr merge <pr> --repo <owner/repo> ${MERGE_STRATEGY} --delete-branch
-```
-
-The merge command is gated by the existing `block-unreviewed-merge.sh`, `block-merge-on-red-ci.sh`, and `require-design-review-for-ui.sh` PreToolUse hooks. The `block-unreviewed-merge.sh` hook also includes a guard that refuses `--squash` on `sync/`-prefixed PRs — so even a direct `gh pr merge <sync-pr> --squash` will be blocked, protecting against both accidental and deliberate strategy errors. If anything else is wrong, the merge fails with the same error message the user would see if they ran `gh pr merge` themselves. The CEO marker stays on disk so the user can retry the merge after fixing the cause without re-approving.
-
-After a successful merge, capture and report the merge commit SHA:
-
-```bash
-gh pr view <pr> --repo <owner/repo> --json mergeCommit -q '.mergeCommit.oid'
-```
+On `MERGE_RC` 0, report `MERGE_SHA` and continue.
+On any other result, show the exact error. The CEO marker stays on disk for a retry.
+`MERGE_RC` 3 means `tracker.kind` is `none`. Report approval and ask the user to merge manually on the host.
+No further `/approve-merge` invocation is needed after that manual merge.
 
 ### 8. Move the board card to "Measurement" (opt-in)
 
@@ -212,82 +228,64 @@ board_move_card "<pr>" "measurement"
 `board_move_card` degrades gracefully — any failure warns to stderr and returns
 0. It never blocks the merge report.
 
-> **Tip — GitHub-native "Done" transition:** the "PR merged → Done" and
-> "Item closed → Done" built-in Workflows in GitHub Projects (Settings →
-> Workflows) handle the final Done hop for free. Enable them in the GitHub UI
-> and your board will reflect closed tickets automatically without any
-> additional hook wiring.
-
 ### 9. Report
 
 Single-line confirmation (include the merge strategy used so the operator can see it):
 
 ```
-✓ Merged PR #<pr> as commit <sha> (strategy: --squash). Branch deleted.
+✓ Merged PR #<pr> as commit <MERGE_SHA> (strategy: squash). Branch deleted.
 ```
 
 or for sync PRs:
 
 ```
-✓ Merged PR #<pr> as commit <sha> (strategy: --merge, auto-detected sync PR — ancestry preserved). Branch deleted.
+✓ Merged PR #<pr> as commit <MERGE_SHA> (strategy: merge, auto-detected sync PR — ancestry preserved). Branch deleted.
 ```
 
-If the merge gate blocked, surface the exact error and tell the user how to retry:
+After a successful merge (`MERGE_RC` 0), add this final report line:
+
+```text
+Next: run /compact to free context before the next task.
+```
+
+If the merge gate blocked (`MERGE_RC` non-zero and not 3), surface the exact error and tell the user how to retry:
 
 ```
-✗ Merge blocked: <reason from gate>. Marker still on disk at <CEO path from review_marker_path> — run `gh pr merge <pr> --repo <owner/repo> <strategy> --delete-branch` once the issue is fixed (no need to re-invoke /approve-merge).
+✗ Merge blocked: <reason from gate>. Marker still on disk at <CEO path from review_marker_path> — fix the issue and re-invoke `/approve-merge <pr>` (the marker is still valid, no need to re-approve).
 ```
+
+If `MERGE_RC` = 3 (`tracker.kind: none`, no host CLI configured):
+
+```
+✓ CEO approval recorded for PR #<pr>. No tracker CLI is configured (tracker.kind: none) — merge <pr> manually on the host; the marker on disk covers the approval, no further /approve-merge invocation needed.
+```
+
+When the merged PR adds a slice record, print `Next: /orbit handoff --slice <path> to file the proposed slice.`
+
+### 9a. Optional: offer to remove the merged PR's worktree
+
+Skip unless `MERGE_RC` is 0 without `--no-merge`. Follow docs/skills/approve-merge-worktree-offer.md.
+List candidates with `.claude/skills/approve-merge/remove-worktree.sh list "<source-tree>" "<head-branch>"`. Ask with `AskUserQuestion` ("Remove it" or "Keep it") and show the ignored files the helper lists. On "Remove it", run `remove-worktree.sh remove "<source-tree>" "<path>" "<head-branch>"`. Never remove a path the helper did not list. Never pass `--force`. Never remove without a yes.
 
 ### 10. Optional: post-merge child-issue closure
 
-If the PR's merge commit / PR body contains `Closes <owner/repo>#<N>` references that GitHub's auto-closer didn't catch (squash merges with cross-repo refs sometimes silently miss), you can offer to close them with a comment. This is **out of scope for the default flow** — only do it if the user explicitly asks. Don't auto-close child issues; that's another externally-visible action that needs its own per-issue confirmation.
+Do this only when the user explicitly asks. Do not auto-close a child issue. Confirm each close on its own. Full rules: docs/skills/approve-merge-rationale.md.
 
 ## --no-merge opt-out
 
 `/approve-merge <pr> --no-merge` writes the marker and stops. Useful when:
 
-- CI is still running and you want to record approval before the green light, then merge later
-- You want to record approval but defer the merge for a batch
-- You want the marker on disk to unblock a teammate who'll do the merge themselves
-- A regulated environment requires temporal separation between approval and execution
+- CI is still running and you want to record approval first
+- You want to defer the merge for a batch
+- A teammate will do the merge
+- A regulated environment separates approval from execution
 
 The skill never writes the marker AND defers the merge in any other case. The default IS auto-merge.
 
 ## Notes
 
-- The marker is gitignored (`.claude/session/` is in `.gitignore`). It's session state, not code.
-- Re-running `/approve-merge <pr>` on the same PR is idempotent — overwrites with current HEAD/timestamp. Useful for a small follow-up (rebase, comment-only fixup) where re-running Rex isn't needed.
-- New commits after the marker is written invalidate the approval — the hook refuses to merge because `sha=` no longer matches PR HEAD. Re-run Rex + `/approve-merge`.
-- The marker format is **versioned**. A bare-SHA legacy marker (skill_version absent) is rejected by the merge gate as of `block-unreviewed-merge.sh` v2 — same release as this skill. Adopters with stale legacy markers from earlier sessions just re-run `/approve-merge` once.
-- The skill intentionally does **not** wait/poll for "the user's 'approved'." The skill exists to be invoked, not to poll.
-
-## Why this default changed
-
-Earlier versions of this skill stopped after writing the marker and required a second user message ("merge it" / "go") before running `gh pr merge`. The split was procedural ceremony, not safety: by the time the skill ran, the user had explicitly named the PR, both Rex and CEO markers were on disk with matching SHAs, and the mechanical merge gates would catch any failure. The second message added latency on every merge for a hypothetical "user changes their mind in 30 seconds" case that almost never happened.
-
-The hardened structured-marker format (introduced in the same change) closes the bypass surface that the two-message ceremony was indirectly hedging against — the model writing a marker via raw `echo` to short-circuit approval. Once that bypass is mechanically blocked, the second message has no work left to do.
-
-See AgDR-0012 for the full trade-off.
-
-## Anti-pattern
-
-```
-You: "I'll execute the plan. Step 1: approve-merge, Step 2: gh pr merge."
-CEO: "go"
-You: *invokes /approve-merge*  ← FAILURE
-```
-
-The CEO's "go" was on the plan. It was not a per-PR approval for the merge. The correct flow:
-
-```
-You: *executes the non-merge steps*
-You: "All other steps done. PR #X ready to merge — approved?"
-CEO: "approved"
-You: *invokes /approve-merge X*  ← writes marker AND merges in one turn
-```
-
-The discrete approval moment is **the invocation of /approve-merge**, not a separate "now do the merge" message. Treat the invocation with the seriousness the merge warrants.
-
----
-
-*Part of [ApexYard](https://github.com/me2resh/apexyard) — multi-project SDLC framework for Claude Code · MIT.*
+- The marker is gitignored session state.
+- A retry replaces the marker with the current head and timestamp.
+- New commits invalidate approval unless the gate verifies Rex carry-over (#1437, #1456). Never rewrite a Rex marker.
+- Legacy bare-SHA markers are rejected. Run this skill again to write version 2.
+- Invoke this skill on human approval. Do not poll for approval.

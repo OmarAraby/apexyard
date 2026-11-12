@@ -6,6 +6,8 @@ argument-hint: "[project-path]"
 effort: medium
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /performance-audit — Bundle & Core Web Vitals Analysis
 
 Deep-dive performance analysis focused on what's measurable from the codebase without running Lighthouse. Checks bundle size, image optimization, lazy loading, code splitting, and caching configuration. Invoke when `/launch-check`'s performance row shows WARN or FAIL.

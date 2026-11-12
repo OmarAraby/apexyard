@@ -1,6 +1,6 @@
 # Container Diagram — ApexYard
 
-> **C4 Level 2** — the functional subsystems inside the ApexYard fork. Non-traditional: ApexYard has no runtime of its own. Each "container" is a folder-scoped set of files interpreted by an external system (Claude Code CLI, the user, or GitHub's rendering).
+> **C4 Level 2** — the functional subsystems inside the ApexYard fork. Non-traditional: ApexYard has no runtime of its own. Each "container" is a folder-scoped set of files interpreted by an external system (Claude Code CLI, Cursor IDE, the user, or GitHub's rendering).
 
 ## Diagram
 
@@ -10,15 +10,17 @@ C4Container
 
     Person(ops, "CEO / CoS / Tech Lead")
     System_Ext(claude, "Claude Code CLI")
+    System_Ext(cursor, "Cursor IDE")
     System_Ext(github, "GitHub")
 
     System_Boundary(apex, "ApexYard (ops fork)") {
-        Container(claudemd, "CLAUDE.md", "Markdown", "Entry point. Claude Code reads this first. Imports rules and role-triggers.")
+        Container(claudemd, "CLAUDE.md", "Markdown", "Entry point. Claude Code and Cursor read this first when native load is on. Indexes rules by name. Load a rule file on demand.")
         Container(rules, ".claude/rules/", "Markdown", "Modular rule files — git conventions, ticket vocabulary, PR workflow, AgDR, PR quality, role triggers, workflow gates, code standards.")
-        Container(hooks, ".claude/hooks/", "Shell scripts", "Mechanical enforcement — merge gates, ticket-first, secrets check, commit format, drift banner. Runs on PreToolUse / PostToolUse / SessionStart events.")
-        Container(skills, ".claude/skills/", "Markdown SKILL.md files", "Slash commands — /setup, /handover, /update, /status, /inbox, /approve-merge, /approve-design, /decide, /code-review, etc. (31 skills)")
-        Container(agents, ".claude/agents/", "Markdown agent defs", "Sub-agent definitions — code-reviewer (Rex), security-reviewer (Hakim), dependency-auditor (Munir), pr-manager (Tariq), ticket-manager (Idris).")
-        Container(roles, "roles/", "Markdown role files", "19 role definitions across engineering / product / design / security / data. Activated by role-triggers.md matcher rules.")
+        Container(hooks, ".claude/hooks/", "Shell scripts", "Mechanical enforcement — merge gates, ticket-first, secrets check, commit format, drift banner. Runs on PreToolUse / PostToolUse / SessionStart. Cursor session-pin overlay lives here too.")
+        Container(overlay, ".cursor/", "hooks.json + rules", "Thin Cursor overlay. sessionStart maps session_id onto CLAUDE_CODE_SESSION_ID. Does not copy the Claude Code gates.")
+        Container(skills, ".claude/skills/", "Markdown SKILL.md files", "Slash commands — /setup, /handover, /update, /status, /inbox, /approve-merge, /approve-design, /decide, /code-review, etc. Cursor's single skill root when third-party configs are on. Custom overrides win. Framework bak copies move to .claude/skill-framework-bak/ so Cursor does not list duplicates (AgDR-0187).")
+        Container(agents, ".claude/agents/", "Markdown agent defs", "Sub-agent definitions — code-reviewer (Rex), security-reviewer (Hakim), dependency-auditor (Munir), solution-architect (Tariq), contrarian (Naqid), plus the department-aligned role agents.")
+        Container(roles, "roles/", "Markdown role files", "20 role definitions across engineering / product / design / security / data / architecture. Activated by role-triggers.md matcher rules.")
         Container(workflows, "workflows/", "Markdown process docs", "SDLC, code review, deployment — the prose contract for how work moves.")
         Container(registry, "apexyard.projects.yaml", "YAML", "Portfolio registry. Lists every managed project. Skills iterate this to aggregate across projects.")
         Container(onboarding, "onboarding.yaml", "YAML", "Per-fork configuration — company, team, tech stack, quality bar.")
@@ -26,12 +28,18 @@ C4Container
         Container(goldens, "golden-paths/", "YAML + Markdown", "Reusable GitHub Actions workflow templates — CI, security, dependency audit, PR title check, review check.")
     }
 
-    Rel(ops, claudemd, "Reads / edits", "via Claude Code or editor")
+    Rel(ops, claudemd, "Reads / edits", "via Claude Code, Cursor, or editor")
     Rel(claude, claudemd, "Loads on session start")
-    Rel(claudemd, rules, "Imports via @.claude/rules/*.md")
+    Rel(cursor, claudemd, "Loads when third-party configs are on")
+    Rel(claudemd, rules, "Indexes by name. Load on demand.")
     Rel(claude, hooks, "Executes on tool events", "bash")
+    Rel(cursor, hooks, "Executes .claude/settings.json gates natively", "bash")
+    Rel(cursor, overlay, "Runs sessionStart pin")
+    Rel(overlay, hooks, "Execs cursor-session-pin.sh")
     Rel(claude, skills, "Invokes on /slash-command", "Skill tool")
     Rel(claude, agents, "Spawns sub-agents", "Agent tool")
+    Rel(cursor, skills, "Loads SKILL.md when third-party configs are on")
+    Rel(cursor, agents, "Loads agent defs when third-party configs are on")
     Rel(hooks, github, "Calls gh CLI", "gh pr / gh issue")
     Rel(skills, github, "Calls gh CLI", "gh pr / gh issue / gh api")
     Rel(skills, registry, "Reads for portfolio iteration")
@@ -45,6 +53,7 @@ C4Container
 ApexYard is unusual in C4 terms: there is **no running process that IS ApexYard**. Every "container" above is a folder of files. The "runtime" is either:
 
 - **Claude Code CLI** — reads `CLAUDE.md`, executes hooks, invokes skills, spawns sub-agents
+- **Cursor IDE** — loads the same `.claude/` runtime when third-party configs are on. The `.cursor/` overlay only maps the session id.
 - **The user** — reads role files, workflow docs, and the portfolio registry manually
 - **GitHub** — renders Markdown in the repo view, enforces branch protection, runs CI on `golden-paths/` pipelines copied into project repos
 
@@ -52,16 +61,17 @@ The diagram captures which "container" does what *when interpreted by the right 
 
 ## Key relationships
 
-- **CLAUDE.md → rules** is the single most important arrow. Every rule file is imported via `@.claude/rules/*.md` from `CLAUDE.md`, and Claude Code applies them. Without that import chain, rules are orphaned prose.
-- **hooks → github** — hooks call `gh` directly (e.g. `block-merge-on-red-ci.sh` runs `gh pr checks`). This is how ApexYard's mechanical enforcement reaches the remote tracker state.
+- **CLAUDE.md → rules** is the single most important arrow. CLAUDE.md indexes every rule file by name. The agent Reads a named file when the work needs it. Hooks remain the mechanical gates. Without the index, rules are orphaned prose.
+- **hooks → github** — hooks call `gh` directly (e.g. `block-merge-on-red-ci.sh` runs `gh pr checks`). When that command does not return a CI result, the hook reads commit check-runs and the combined commit status (AgDR-0244). This is how ApexYard's mechanical enforcement reaches the remote tracker state.
 - **skills → github** — skills are the user-facing portfolio-aware commands. Most call `gh` at some point; some also read the registry to iterate.
 - **skills → registry / projectdocs** — the portfolio-level read/write flow. `/inbox` / `/status` / `/projects` / `/stakeholder-update` all live here.
+- **cursor → skills** — Cursor loads `.claude/skills/` only as the fork skill root. Open the fork, not a parent that also holds `custom-skills/`. Override bak dirs keep a recoverable copy (manual restore; `/update` does not restore) but do not expose a second `SKILL.md` name (AgDR-0187 / #1377).
 
 ## What this diagram does NOT show
 
 - Specific hook-to-rule mapping (which hook enforces which rule) — see `docs/rule-audit.md` for that.
-- The full list of 31 skills — see CLAUDE.md § "Available skills".
-- The full list of 19 roles — see `.claude/rules/role-triggers.md`.
+- The full list of 66 skills — see CLAUDE.md § "Available skills".
+- The full list of 20 roles — see `.claude/rules/role-triggers.md`.
 - The user's local `workspace/<name>/` clones of managed projects — they're gitignored and sit outside the ApexYard boundary (they belong to the managed project, not to ApexYard).
 
 ## Related diagrams
@@ -79,3 +89,69 @@ Updates when:
 - The Claude Code integration model changes (new event type, new agent shape)
 
 Skill-count / hook-count / role-count drift goes in the relevant summary docs (CLAUDE.md, hooks/README.md), not here. This diagram stays at the "shape of the fork" level.
+
+## Evolution
+
+**2026-10-19 — Carry-over walk batching and per-call gh limit (AgDR-0256 evolution, me2resh/apexyard#1796).** The merge-gate hooks still call GitHub through `gh`. The Rex carry-over walk now loads the base tip and up to 10 first-parent commits in one GraphQL call, and Rex/CEO share that result in one gate process. Each merge-route `gh` call has a 20 s limit (`_lib-gh-timeout.sh`) so one stall cannot use the whole dispatcher budget. Reasoning: the #1770 four-step merge-dev chain made the post-#1759 route 10 calls with simulated p95 19 s, which broke NFR-1 under a 60 s timeout. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-10-19 — Carry-over walk host and string-var hardening (AgDR-0256 evolution, me2resh/apexyard#1796 / #1809).** The walk returns `unknown` with no forge call for a host-qualified repo whose host is not `github.com`. GraphQL string variables use `-f`. `tracker_review_at_sha` uses `apexyard_gh`. Reasoning: stripping a non-github host and querying the default host reads a twin repository on github.com (Hakim H1); `-F` coerces an all-digit owner to an integer (A3); the reviews API had no per-call limit (A2). The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-10-12 — Reviewer scratchpad ticket exemption (AgDR-0231, me2resh/apexyard#1417).** A sanctioned review can write under the session scratchpad without a ticket. The hook reads `scratchpad_dir` when the harness sends it. The path must contain this session id as a path segment, sit under a temp root, and stay outside the ops fork and every registered workspace. A `..` segment or a symlink stays gated. When `scratchpad_dir` is absent, only a temp path that contains this session id as a path segment qualifies. Reasoning: the export step is an unextractable write, so the non-git exemption never saw it, and the reviewer lock blocks creating a scratch clone after the marker is armed. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-30 — Artifact completeness shared validator (AgDR-0202, me2resh/apexyard#1343).** The AgDR-0161 local validator now profiles Rex, Tariq, PR, and AgDR bodies. PR creation calls it for supplied bodies. The PR-section skip marker and `.pr.skip_marker` are removed. Review triage from #1343 stays dropped after spike #1341 was closed as not planned. Reasoning: one structure check beats drifting per-producer rules; skip markers hid incomplete evidence. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-30 — Write detector closes versioned Python and here-doc fail-open (AgDR-0203, me2resh/apexyard#1502).** `_lib-detect-bash-write.sh` missed `python3.12 -c` writes, hid `-c` behind option arguments that contain the letter `c`, and reported no write when a bash 3.2 segment here-doc could not create its temp file. Fix: match versioned `pythonX.Y` tokens, allow intervening option text before a short flag that contains `c`, and fail closed when a segment here-doc `read` never runs. Reasoning: the ticket and migration gates must see the write or refuse to claim a read. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-30 — Release changelog timeout and missing-PR warning (AgDR-0208 / AgDR-0197, me2resh/apexyard#1506).** Each scoped `(#PR)` close check now bounds `gh pr view` with `PR_LOOKUP_TIMEOUT` (default 10s). A timeout or rate-limit error is a failed read with the scoped-title fallback warning. A scoped commit with no trailing `(#PR)` prints a warning that names the commit and emits no close. Reasoning: a hung forge must not stall a release cut, and a direct push must not hide a missing close. The C4 containers stay the same. The change sits inside `bin/` and the release skill path.
+
+**2026-09-29 — Cursor skill one-root / override wins (AgDR-0187, me2resh/apexyard#1377).** Cursor keyed skills by frontmatter `name`. A custom override left the framework copy under `.claude/skills/<name>.framework.bak/` with the same name. Cursor listed two entries. Fix: keep `.claude/skills/` as the only Cursor skill root. Move bak copies to `.claude/skill-framework-bak/`. Adapter sync writes a managed `.cursorignore` block for bak paths inside the fork (not in-fork custom skill sources). Install and docs warn operators not to open a parent portfolio workspace. Bak restore is manual; `/update` does not restore it. `bin/list-cursor-skills.sh` checks uniqueness without launching Cursor.
+
+The skills container stays the same path. The bak copy is no longer inside that container.
+
+**2026-09-16 — native-first Cursor overlay (AgDR-0151, me2resh/apexyard#1311).** Cursor.app 3.10.20 executed unmodified `.claude/hooks/*.sh` through the Claude Code loader. The generated 86-entry `hooks.json` copy became a lock-the-session hazard (`failClosed` plus leftover user config). Architecture change: Cursor is now a runtime of `.claude/`, not a second gate list. `.cursor/` is a one-hook overlay that maps `session_id` onto `CLAUDE_CODE_SESSION_ID`. Skill count on this diagram moved from 31 to 66 to match CLAUDE.md.
+
+**2026-09-16 — Bash PreToolUse dispatcher (AgDR-0157, me2resh/apexyard#1317).** Claude Code Bash `PreToolUse` no longer fans out one process per gate. `.claude/settings.json` registers one dispatcher. `.claude/hooks/dispatch-bash.sh` runs the existing hook scripts by command prefix. Policy still lives in those scripts. pi and opencode derive the same routes from the dispatcher table. They do not exec the dispatcher as a nested gate.
+
+Unconditional safety hooks now always run before command-specific gates. The first blocking reason can change when two gates would both exit 2. If command parse fails, the dispatcher still runs the merge gates so a missing `jq` cannot skip T13. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-17 — SessionStart dispatcher (AgDR-0159, me2resh/apexyard#1318).** SessionStart no longer fans out one process per hook. `.claude/settings.json` registers one dispatcher. `.claude/hooks/dispatch-session-start.sh` runs `pin-ops-root.sh` first. It then runs the remaining SessionStart scripts concurrently. Policy still lives in those scripts.
+
+The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-17 — Token-efficiency Wave 2 (AgDR-0160, me2resh/apexyard#1319).** CLAUDE.md is an index. It no longer `@`-imports every rule body. Agents Read a named file under `.claude/rules/` when the work needs it. Hard gates stay in the hooks container. AGENTS.md stays a short operator bridge. The Claude Code baseline on `dev` `3953d50` was about 43.1k tokens (15 `@` imports, not a 22-file glob). The Wave 2 test caps the CLAUDE.md catalogue at 9,000 tokens and AGENTS.md at 5,000 tokens.
+
+The C4 containers stay the same. The CLAUDE.md → rules arrow is now index-plus-on-demand, not glob import.
+
+**2026-09-21 — Rules auto-load tax closed (AgDR-0160 correction, me2resh/apexyard#1354).** Wave 2's "on demand" claim was incomplete. Claude Code still auto-injects every `.claude/rules/**/*.md` file as project memory even with no `@` import. Cost: ~175 KB (~44k tokens) per session, including regression fixtures. Fix: (1) `"claudeMdExcludes": ["**/.claude/rules/**"]` in `.claude/settings.json`; (2) move fixtures to `docs/quality-regression/fixtures/` and rule smoke tests to `.claude/hooks/tests/`. Agents still Read named rule files on demand. Reasoning: exclude is the platform control; relocating non-rule markdown is defence in depth so fixtures cannot re-enter the auto-load tree.
+
+The C4 containers stay the same. The CLAUDE.md → rules path is now index + exclude + Read-on-demand.
+
+**2026-09-17 — /update chain backfill for v5.6.0–v5.6.2 (me2resh/apexyard#1298).** Three releases shipped with no pair script. `migration_chain` refused at v5.5.2 and returned empty. The C4 containers stay the same. The change is three no-op placeholders under `.claude/migrations/`, so `/update` can walk v5.4.0 → v5.6.2 again. The `/release` missing-script check stays advisory, per #1105.
+
+**2026-09-17 — Rex body validation before marker write (AgDR-0161, me2resh/apexyard#1322).** The Output Format was instruction-only. A posted review could omit required headings and still write a SHA marker. `_lib-review-markers.sh` now validates the local body, requires a `**APPROVED**` verdict line, and requires a matching footer SHA before the write. The merge gate still reads only the SHA. The hooks container stays the gate.
+
+**2026-09-18 — Tracker adapter stderr pass-through (me2resh/apexyard#1332).** `tracker_create` already forwarded CLI stderr after #1327. `tracker_view`, `tracker_list`, and `tracker_review_submit` now do the same for gh, glab, and custom adapters. Custom templates must not enable verbose HTTP tracing. Merge-SHA lookups still swallow stderr. The hooks container stays the gate.
+
+**2026-09-18 — Adapter-test yq guard (me2resh/apexyard#1328).** `test_manage_portfolio_adapters.sh` exited 1 when yq was absent. The manager script still requires yq. The test now reports PASS and exits 0 when yq is missing. It does not print SKIP. `bin/run-hook-tests.sh` treats a SKIP line as a failed suite. CI still runs the real cases because CI has yq. The C4 containers stay the same.
+
+**2026-09-18 — Dispatch merge gates inside command wrappers (AgDR-0162, me2resh/apexyard#1338).** The Bash dispatcher matched merge commands by prefix. `/approve-merge` wraps `tracker_pr_merge` in `bash -c`, so the four merge gates never ran. The dispatcher now also routes when `is_merge_command` matches the full payload command. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-18 — Commit-ref `-C` outranks payload cwd (AgDR-0163, me2resh/apexyard#1340).** `verify-commit-refs.sh` ranked harness `.cwd` above a this-commit `git -C` path. Claude Code and Cursor always send `.cwd`, so the `#1050` parser never ran. The hook now ranks the message-stripped, this-invocation scrape first. Payload `.cwd` stays the default when the command has no `-C` or `cd`. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-09-18 — v5.6.3 count and docs refresh (me2resh/apexyard#1345).** Live summaries now say 60 non-lib hooks, 66 skills, 23 agents, 22 rules, and 20 roles. The C4 roles container count moved from 19 to 20. `/release-sync` for v5.6.2 made `main` an ancestor of `dev`. The C4 containers stay the same.
+
+**2026-09-29 — Dependency audit ecosystem dispatch (AgDR-0176, me2resh/apexyard#1359).** The goldens container now ships a shared helper at `golden-paths/pipelines/scripts/dependency-audit.py`. `/audit-deps`, Munir, and `dependency-audit.yml` share finite npm + Python discovery, severity, licence, and remediation contracts. Python inventory is data-only. Trusted scanners run outside the checkout. Reasoning: the prior npm-only assumption left Python dependencies unaudited and unnamed in the report. The C4 containers stay the same. The change sits inside goldens, skills, and agents.
+
+**2026-10-09 — One quoted-flag parser (me2resh/apexyard#1586).** `_lib-flag-value.sh` is the only quoted-flag parser. Four hooks source it. The old copies did not match. Issue structure and the ORBIT gate close a quoted value on one dash or two. The AgDR gate and the leak gate close it on two dashes only. The leak gate also keeps the last quote for detection and the first qualifying quote for the skip marker. Callers pass those choices in. The staged and push private-reference hooks read `private_refs_match_init` by its return code only. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-10-12 — Reviewer GitHub App (AgDR-0235, me2resh/apexyard#1538).** `tracker_review_submit` posted GitHub reviews with the operator `gh` login. An agent approval could count as that person's approval. Opt-in `review_identity.kind=github_app` mints an installation token. It sets `GH_TOKEN` for that one `gh pr review` command. The private key must sit outside every git work tree and outside `.claude/`. The token is not exported, logged, or written to disk. Mint failure fails closed. `fallback` value `comment` posts an operator comment instead. `tracker_pr_merge` and `/approve-merge` stay on the operator login. Branch protection needs a different account. The merge stays a human action. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-10-12 — Menu approval from the harness question tool (AgDR-0234, me2resh/apexyard#1391).** The operator can approve a merge or a design review from an `AskUserQuestion` menu. `record-menu-approval.sh` reads the harness payload and writes the menu record. The record has the same trust level as a typed marker: no file in this repo is unreadable by the model tools, and an HMAC key would not prove the writer. A PreToolUse guard blocks Edit, Write and Bash writes of `approval_channel=menu`, and Bash calls that name the recorder or its library. It is a text-match backstop (AgDR-0104).
+
+That guard is a text backstop (AgDR-0104). The typed commands stay. The gates still require the recorded SHA to match the PR head. The C4 containers stay the same. The change is inside the hooks container.
+
+**2026-10-17 — Unsupported dependency manifests (me2resh/apexyard#1744).** The dependency-audit helper lists known unsupported manifests in `not_scanned`. The helper exits 3 for those files only when no npm or Python dependency set is selected for checks and no `--ecosystem` filter is set. A Critical finding still exits 1. Every other case keeps the normal exit code. The report keeps the Not scanned section and the coverage note. An empty tree exits 0 and records that no dependency manifests were found. The helper does not add a NuGet runner. The C4 containers stay the same. The change sits in the goldens helper, the audit workflow summary, and the audit-deps skill.
+
+**2026-10-19 — Ticket marker session and branch warning (AgDR-0257, me2resh/apexyard#1533).** The ticket marker now records `session_id` and `branch`. `/start-ticket` asks before it overwrites a different ticket from a different session. Headless and `/fan-out` runs cancel and leave the marker unchanged. `require-active-ticket.sh` and `require-migration-ticket.sh` warn once per session when the marker session or branch does not match. The mismatch never blocks. Reasoning: two sessions in one clone overwrote the marker with no message, so edits passed against the wrong ticket. The C4 containers stay the same. The change is inside the hooks container and the start-ticket skill.
+
+**2026-10-19 — No macOS CI runners (AgDR-0259, me2resh/apexyard#1814).** Hook CI drops every `macos-latest` matrix leg. Linux jq-1.7 and jq-1.8 remain. `refresh-ready-prs.yml` runs on `workflow_dispatch` only. PR workflows cancel superseded runs. Every job has a timeout of 30 minutes or less. Bash 3.2 and macOS system awk run locally before push (`/bin/bash bin/run-hook-tests.sh`). Reasoning: macOS Actions minutes filled the CI queue and dominated list-price cost. The C4 containers stay the same. The change sits in `.github/workflows/` and contributor docs.

@@ -11,9 +11,6 @@
 #   VERSION    — the new version string (e.g. v3.3.0)
 #   DATE       — the release date in YYYY-MM-DD format
 #
-# Optional:
-#   REPO_REMOTE — the git remote to use for upstream refs (default: upstream)
-#
 # Output format (matches the existing CHANGELOG.md convention):
 #
 #   ## [VERSION] — DATE
@@ -33,13 +30,86 @@
 #   - <subject> — <short-sha>
 #   ...
 #   ### Closes
-#   - Closes #N, #M, ...
+#   - Closes #N
+#   - Closes #M
+#   ...
+#
+# Closes resolution (#1056, #1076, #1490):
+#   GitHub's `Closes` keyword only auto-closes the reference IMMEDIATELY
+#   FOLLOWING it — a single "Closes #A, #B, #C" line only ever closes #A, so
+#   the section above emits one "- Closes #N" bullet per reference instead.
+#
+#   Governing rule (#1076 + #1490): PREFER A MISSING CLOSE OVER A WRONG
+#   CLOSE. A `- Closes #N` bullet is emitted ONLY when BOTH are true:
+#     1. the commit subject carries a recognised, SAME-REPO conventional-
+#        commit SCOPE holding the issue number — `fix(#1042): ...`
+#     2. the real PR body (fetched via `gh pr view`, NOT the squash commit
+#        body) contains a GitHub closing keyword for that same number —
+#        `Closes #1042`, `Fixes #1042`, or `Resolves #1042` (and their
+#        tense variants)
+#
+#   Why gh, not `git log %b`: this repo squash-merges with
+#   `squash_merge_commit_message=COMMIT_MESSAGES`, so the squash commit
+#   body is the branch's commit messages, not the PR description. Reading
+#   `%b` silently drops real closes (e.g. PR #1493's body says
+#   "Closes #1492" but its squash body has no closing keyword).
+#
+#   For each scoped commit whose subject ends in `(#<PR>)`, the script
+#   runs one bounded `$RELEASE_GH pr view` call (default 10s via
+#   `PR_LOOKUP_TIMEOUT`; prefers GNU `timeout`, then macOS `gtimeout`):
+#     $RELEASE_GH pr view <PR> --repo <repo> --json body --jq .body
+#   (`RELEASE_GH` defaults to `gh`; tests inject a stub). Emit a close
+#   for #N only when that PR body closes #N. If the fetch fails (gh
+#   error, rate limit, or timeout), keep the pre-#1490 / `dev` behaviour
+#   for THAT commit (scoped title closes) and print a warning naming the
+#   PR — never silently drop a close because the forge was briefly
+#   unreachable. Cost: one API call per scoped commit with a trailing
+#   `(#<PR>)` (AgDR-0197 / #1506).
+#
+#   A title / scope alone is NOT enough when the PR body is readable
+#   (#1490). A PR titled `feat(#N)` whose body says only `Refs #N` must
+#   NOT produce a close line. That nearly closed partially-fixed issues
+#   in v5.7.0.
+#
+#   Everything else emits NO Closes line at all:
+#     - a SCOPED subject whose PR body only Refs / mentions #N (#1490)
+#     - a SCOPED subject with no trailing `(#<PR>)` — nothing to fetch,
+#       prefer missing over guessing from the squash body, and print a
+#       warning that names the commit so a direct-push author sees the
+#       missing close (#1506)
+#     - an UNSCOPED subject (`docs: ... (#1045)`) — the only "(#N)" present
+#       is GitHub's squash-appended trailing PR number, which is not an
+#       issue (#1076). Body text alone never opens a close either — scope
+#       is still required, so prose like "We used to say Fixes #999" cannot
+#       invent a close
+#     - a CROSS-REPO scope (`docs(owner/repo#148): ...`) — the scope names an
+#       issue in a DIFFERENT repo; a bare "Closes #148" would auto-close the
+#       WRONG repo's issue #148 if this repo happens to have one too (the
+#       #207 lesson, reintroduced by treating a cross-repo ref as local)
+#     - a REVERT commit (`Revert "fix(#1042): ..."`) — closing the same issue
+#       the reverted commit closed would re-close something the revert just
+#       undid
+#     - a "Merge pull request #NN from ..." merge commit whose OWN subject
+#       has no scope — same unscoped rule as above
+#
+# Optional env:
+#   RELEASE_GH         — gh binary / stub (default: gh). Injectable for tests.
+#   REPO_REMOTE        — remote whose URL yields the --repo target (default:
+#                        derived from HEAD_REF's remote prefix, else "upstream")
+#   PR_LOOKUP_REPO     — owner/repo for `gh pr view --repo` (default: derived
+#                        from REPO_REMOTE's URL)
+#   PR_LOOKUP_TIMEOUT  — seconds to bound each `gh pr view` call (default: 10).
+#                        Prefers GNU `timeout`, then macOS `gtimeout`. If
+#                        neither is on PATH the call is unbounded and a
+#                        one-time stderr warning is printed (#1078 / #1506).
 #
 # Exit codes:
 #   0 — success (even if the commit list is empty; that is a valid patch release)
 #   1 — missing required env var or git command failure
 
 set -euo pipefail
+
+RELEASE_GH="${RELEASE_GH:-gh}"
 
 # ── Validate required env vars ──────────────────────────────────────────────
 
@@ -51,42 +121,114 @@ for var in PREV_TAG HEAD_REF VERSION DATE; do
   fi
 done
 
-REPO_REMOTE="${REPO_REMOTE:-upstream}"
+# ── Resolve which remote / repo PR bodies are fetched from (#1077 / #1490) ──
+# An explicit REPO_REMOTE always wins. Otherwise derive it from HEAD_REF's
+# own remote prefix WHEN that prefix names a remote that actually exists.
+# Bare HEAD_REF falls back to "upstream". PR_LOOKUP_REPO then comes from
+# that remote's URL unless the caller set it explicitly.
+if [ -z "${REPO_REMOTE:-}" ]; then
+  _head_ref_remote="${HEAD_REF%%/*}"
+  if [ "$_head_ref_remote" != "$HEAD_REF" ] && git remote get-url "$_head_ref_remote" >/dev/null 2>&1; then
+    REPO_REMOTE="$_head_ref_remote"
+  else
+    REPO_REMOTE="upstream"
+  fi
+fi
+
+_derive_pr_lookup_repo() {
+  local url
+  url=$(git remote get-url "$REPO_REMOTE" 2>/dev/null) || return 0
+  echo "$url" | sed -nE 's|.*[:/]([^/:]+/[^/]+)\.git$|\1|p; s|.*[:/]([^/:]+/[^/]+)$|\1|p' | head -1
+}
+
+if [ -z "${PR_LOOKUP_REPO:-}" ]; then
+  PR_LOOKUP_REPO=$(_derive_pr_lookup_repo)
+fi
+
+# ── Resolve the gh-call timeout wrapper once (#1078 / #1506) ─────────────────
+# Computed once here — NOT per-call inside fetch_pr_body — so the "no timeout
+# binary" warning fires at most once per release cut. Only bother when a
+# lookup could happen (a repo was resolved); otherwise fetch_pr_body
+# short-circuits before any gh call.
+PR_LOOKUP_TIMEOUT="${PR_LOOKUP_TIMEOUT:-10}"
+PR_LOOKUP_TO=""
+if [ -n "${PR_LOOKUP_REPO:-}" ]; then
+  if command -v timeout >/dev/null 2>&1; then
+    PR_LOOKUP_TO="timeout -k 2 ${PR_LOOKUP_TIMEOUT}"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    PR_LOOKUP_TO="gtimeout -k 2 ${PR_LOOKUP_TIMEOUT}"
+  else
+    echo "WARN: neither 'timeout' nor 'gtimeout' found on PATH — gh pr view calls in fetch_pr_body() are UNBOUNDED; a hung forge could stall this release cut indefinitely (#1078 / #1506). On macOS: brew install coreutils for gtimeout." >&2
+  fi
+fi
 
 # ── Build the git log range ──────────────────────────────────────────────────
 
 if [ "$PREV_TAG" = "NONE" ]; then
   LOG_RANGE="${HEAD_REF}"
 else
-  # #737: PREV_TAG is a *squash* commit on main. Under the release-cut model the
-  # individual commits it squashed live on HEAD_REF (dev) but are NOT ancestors
-  # of the tag — so a naive PREV_TAG..HEAD_REF range (and even
-  # merge-base(PREV_TAG,dev)..dev) surfaces EVERY already-released commit,
-  # massively over-counting (v4.1.0 reported 102 feats / 263 commits for a
-  # ~1-feature delta). The correct start is the POST-SYNC BOUNDARY: after each
-  # release, `/release-sync` lands a "sync: merge main into dev after <ver>"
-  # commit (and its "...sync/main-to-dev-after-<ver>" PR merge) on dev. Commits
-  # AFTER the most recent such marker are exactly the unreleased delta.
-  # Patterns are VERSION-ANCHORED so they only match real sync commits, never a
-  # prose mention of the convention in some other commit body (e.g. this very
-  # fix's commit, or a doc PR) — an unanchored 'sync/main-to-dev-after' would
-  # let a later commit hijack the boundary and DROP unreleased work (#749 review).
-  SYNC=$(git log "$HEAD_REF" --max-count=1 --pretty=format:'%H' \
-           --grep='^sync: merge main into dev after v[0-9]' \
-           --grep='sync/main-to-dev-after-v[0-9]' 2>/dev/null || true)
-  if [ -n "$SYNC" ]; then
-    LOG_RANGE="${SYNC}..${HEAD_REF}"
+  # AgDR-0094 (#872): prefer the RECORDED cut point over inferring one. Since
+  # the fix landed, `/release` writes a `Released-From: <dev-sha>` trailer into
+  # the release squash commit — that sha IS the exact dev tip the release was
+  # cut from, so TRAILER..HEAD_REF is deterministic and immune to both the
+  # #737 over-count and the #872 late-sync under-count (a late `/release-sync`
+  # merge can no longer mis-anchor the boundary, because we're not inferring
+  # it from sync-commit position anymore). Only look at PREV_TAG's own commit
+  # message — that's the squash commit the trailer was written into.
+  TRAILER_SHA=$(git log -1 --pretty=format:'%(trailers:key=Released-From,valueonly,separator=%x0A)' "$PREV_TAG" 2>/dev/null \
+                  | tail -n 1 | tr -d '[:space:]' || true)
+
+  if [ -n "$TRAILER_SHA" ] && git cat-file -e "${TRAILER_SHA}^{commit}" 2>/dev/null; then
+    LOG_RANGE="${TRAILER_SHA}..${HEAD_REF}"
   else
-    # No sync boundary on dev (first release under the model, or sync skipped):
-    # best available fallback is the merge-base, then the raw tag range.
-    BASE=$(git merge-base "$PREV_TAG" "$HEAD_REF" 2>/dev/null || true)
-    LOG_RANGE="${BASE:-$PREV_TAG}..${HEAD_REF}"
+    # No trailer (pre-AgDR-0094 release, or a mangled/unknown sha) — fall back
+    # to the #737 sync-boundary heuristic below, unchanged.
+    #
+    # #737: PREV_TAG is a *squash* commit on main. Under the release-cut model
+    # the individual commits it squashed live on HEAD_REF (dev) but are NOT
+    # ancestors of the tag — so a naive PREV_TAG..HEAD_REF range (and even
+    # merge-base(PREV_TAG,dev)..dev) surfaces EVERY already-released commit,
+    # massively over-counting (v4.1.0 reported 102 feats / 263 commits for a
+    # ~1-feature delta). The correct start is the POST-SYNC BOUNDARY: after each
+    # release, `/release-sync` lands a "sync: merge main into dev after <ver>"
+    # commit (and its "...sync/main-to-dev-after-<ver>" PR merge) on dev. Commits
+    # AFTER the most recent such marker are exactly the unreleased delta.
+    # Patterns are VERSION-ANCHORED so they only match real sync commits, never a
+    # prose mention of the convention in some other commit body (e.g. this very
+    # fix's commit, or a doc PR) — an unanchored 'sync/main-to-dev-after' would
+    # let a later commit hijack the boundary and DROP unreleased work (#749 review).
+    #
+    # KNOWN LIMITATION this heuristic cannot fix (why AgDR-0094 exists): if the
+    # matching `/release-sync` merges LATE — landing near dev's tip, after many
+    # newer commits — this still anchors on that late marker and silently drops
+    # everything merged before it (#872). The trailer above is the real fix;
+    # this stays as the fallback for releases cut before it existed.
+    SYNC=$(git log "$HEAD_REF" --max-count=1 --pretty=format:'%H' \
+             --grep='^sync: merge main into dev after v[0-9]' \
+             --grep='sync/main-to-dev-after-v[0-9]' 2>/dev/null || true)
+    if [ -n "$SYNC" ]; then
+      LOG_RANGE="${SYNC}..${HEAD_REF}"
+    else
+      # No sync boundary on dev (first release under the model, or sync skipped):
+      # best available fallback is the merge-base, then the raw tag range.
+      BASE=$(git merge-base "$PREV_TAG" "$HEAD_REF" 2>/dev/null || true)
+      LOG_RANGE="${BASE:-$PREV_TAG}..${HEAD_REF}"
+    fi
   fi
 fi
 
+# ── Expose the resolved range to the caller (#1002) ──────────────────────────
+# The /release skill's count-mismatch guard used to compare the changelog's
+# entry count against `git rev-list --count upstream/main..upstream/dev` —
+# structurally wrong under the release-cut squash model, where main..dev never
+# shrinks (see #1002). The guard should compare against the SAME range this
+# script actually generated the changelog from. Printed to stderr (not
+# stdout) so it never pollutes the changelog markdown callers capture.
+echo "RELEASE_CHANGELOG_RANGE=${LOG_RANGE}" >&2
+
 # ── Extract commits ──────────────────────────────────────────────────────────
 # Format: <short-sha> <subject>
-# We use %h (abbreviated sha) and %s (subject) so merge commits are included.
+# Closes reads the PR body via gh (#1490), not the squash commit body.
 
 COMMITS=$(git log "$LOG_RANGE" --pretty=format:'%h %s' 2>/dev/null || true)
 
@@ -98,17 +240,108 @@ changed_lines=()
 breaking_lines=()
 closes_nums=()
 
-# Extract PR number from subject: "Merge pull request #NN from ..." or "(#NN)" in subject
-extract_pr_num() {
+# Extract the conventional-commit SCOPE's issue ref, if any — a Closes
+# CANDIDATE under #1076 / #1490 (never sufficient alone when the PR body
+# is readable; the PR body must also carry a closing keyword for the same
+# number):
+#   "fix(#1042): ..."                    -> "#1042"
+#   "docs(me2resh/apexyard#148): ..."    -> "me2resh/apexyard#148"
+#   anything without a `type(...):` scope at the very start -> "" (empty)
+# Accepting the "owner/repo#N" shape (#1076) lets the caller recognise a
+# cross-repo scope explicitly, rather than falling through to the unscoped
+# path and misreading it as a bare, same-repo issue number (the #207 lesson).
+#
+# NB: the "no match" case is the COMMON case (most commits carry no scope at
+# all), and under `set -euo pipefail` a grep pipeline that finds nothing
+# exits non-zero. The trailing `|| true` is load-bearing, not decorative —
+# without it, `scope_ref=$(extract_scope_ref "$subject")` at a top-level call
+# site (not nested inside another function) aborts the whole script the
+# first time it hits an unscoped commit, because the command substitution's
+# exit status becomes the assignment's exit status under `set -e`.
+extract_scope_ref() {
   local subject="$1"
-  # Merge commit format: "Merge pull request #NNN from ..."
-  if echo "$subject" | grep -qE 'Merge pull request #[0-9]+'; then
-    echo "$subject" | grep -oE '#[0-9]+' | head -1
+  echo "$subject" \
+    | grep -oE '^[a-z]+\(([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+\)!?:' \
+    | grep -oE '\(([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+\)' \
+    | sed -E 's/^\(//; s/\)$//' \
+    || true
+}
+
+# True when $1 (a PR / commit body) contains a GitHub auto-closing keyword
+# targeting issue #$2. Mirrors validate-pr-create.sh's keyword set:
+# close[sd]?, fix(e[sd])?, resolve[sd]?. `Refs #N` is intentionally NOT a
+# match — that is the #1490 failure mode. Cross-repo qualifiers
+# (`owner/repo#N`) are ignored here: callers only ask about a same-repo
+# scope number, and a foreign-qualified close must not count as local.
+#
+# Portable word-boundary: (^|[^A-Za-z0-9_]) instead of \b, so macOS
+# /bin/bash 3.2 + BSD grep and GNU grep on Linux CI agree.
+body_closes_issue() {
+  local body="$1"
+  local num="$2"
+  printf '%s\n' "$body" \
+    | grep -qiE "(^|[^A-Za-z0-9_])(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#${num}([^0-9]|$)"
+}
+
+# Trailing `(#N)` at the very END of the subject — GitHub's squash-merge
+# append position. This is the PR number used to fetch the real PR body
+# (#1490). Distinct from extract_pr_num, which may fall back to the scope
+# for DISPLAY when there is no trailing squash number.
+extract_trailing_pr_num() {
+  local subject="$1"
+  if echo "$subject" | grep -qE '\(#[0-9]+\)$'; then
+    echo "$subject" | grep -oE '\(#[0-9]+\)$' | grep -oE '#[0-9]+'
     return
   fi
-  # Conventional commit with PR ref: "feat(#NNN): ..." or "feat: something (#NNN)"
-  if echo "$subject" | grep -qE '\(#[0-9]+\)'; then
-    echo "$subject" | grep -oE '#[0-9]+' | head -1
+  echo ""
+}
+
+# Fetch the real PR body via $RELEASE_GH. Prints body on stdout and returns
+# 0 on success (including an empty body); returns 1 on any failure (missing
+# repo, gh error, rate limit, or timeout). Never aborts the release —
+# callers decide the fallback.
+fetch_pr_body() {
+  local pr_num="$1"  # numeric, no leading '#'
+  local body
+  if [ -z "${PR_LOOKUP_REPO:-}" ]; then
+    return 1
+  fi
+  # PR_LOOKUP_TO is "timeout -k 2 N" or empty — intentional word-split.
+  # shellcheck disable=SC2086
+  if ! body=$($PR_LOOKUP_TO "$RELEASE_GH" pr view "$pr_num" --repo "$PR_LOOKUP_REPO" --json body --jq .body 2>/dev/null); then
+    return 1
+  fi
+  printf '%s' "$body"
+  return 0
+}
+
+# Extract the DISPLAY ref shown in "($N) <subject>" — anchored, never "the
+# first #N anywhere in the subject" (#1076). In priority order:
+#   1. "Merge pull request #NNN from ..." — the number immediately following
+#      that fixed phrase
+#   2. a trailing "(#NNN)" at the very END of the subject — GitHub's
+#      squash-merge append position
+#   3. the conventional-commit SCOPE ref (extract_scope_ref), for a scoped
+#      commit that carries no separate trailing squash number (e.g. a single,
+#      un-squashed "fix(#1042): ..." commit) — this is DISPLAY only; it does
+#      NOT change which numbers are eligible for a Closes bullet
+# A "#N" appearing anywhere else in the subject (e.g. prose incidentally
+# mentioning another issue, or a cross-repo "other-repo#12" reference) is
+# NEVER picked up — that was the root cause of #1076's wrong-close shapes.
+extract_pr_num() {
+  local subject="$1"
+  if echo "$subject" | grep -qE 'Merge pull request #[0-9]+'; then
+    echo "$subject" | grep -oE 'Merge pull request #[0-9]+' | grep -oE '#[0-9]+' | head -1
+    return
+  fi
+  if echo "$subject" | grep -qE '\(#[0-9]+\)$'; then
+    echo "$subject" | grep -oE '\(#[0-9]+\)$' | grep -oE '#[0-9]+'
+    return
+  fi
+  local scope_ref
+  scope_ref=$(extract_scope_ref "$subject")
+  if [ -n "$scope_ref" ]; then
+    echo "#${scope_ref##*#}"
     return
   fi
   echo ""
@@ -142,6 +375,17 @@ while IFS= read -r line; do
     continue
   fi
 
+  # #1076 — a revert commit must never re-derive a Closes from the subject it
+  # reverted: closing the issue the reverted commit closed would re-close
+  # something the revert just undid. Detected before any Closes decision
+  # below; the commit itself still gets a display entry (in whichever bucket
+  # its own subject classifies into further down), it just never gets a
+  # closes_num.
+  is_revert=0
+  if echo "$subject" | grep -qE '^Revert '; then
+    is_revert=1
+  fi
+
   pr_num=$(extract_pr_num "$subject")
   display_subject=$(strip_cc_prefix "$subject")
 
@@ -151,11 +395,54 @@ while IFS= read -r line; do
   # Build the display line
   if [ -n "$pr_num" ]; then
     entry="- ($pr_num) $display_subject — $short_sha"
-    # Collect PR number for Closes section
-    num_only="${pr_num#\#}"
-    closes_nums+=("$num_only")
   else
     entry="- $display_subject — $short_sha"
+  fi
+
+  # #1076 + #1490 — Closes decision. Governing rule: prefer a MISSING close
+  # over a WRONG close. A Closes bullet requires a same-repo conventional-
+  # commit scope AND (when the PR body is readable) a closing keyword for
+  # that number in the real PR body fetched via gh. The squash commit body
+  # is NOT consulted — COMMIT_MESSAGES squash strategy stores branch commit
+  # messages there, not the PR description. Title / scope alone is not
+  # enough when the fetch succeeds — that is how `feat(#N)` + `Refs #N`
+  # nearly closed partially fixed issues in v5.7.0. If gh fails for a PR,
+  # fall back to the pre-#1490 / `dev` behaviour (scoped title closes) and
+  # warn — never silently drop a close because of a fetch failure.
+  # Unscoped, cross-repo, and revert commits emit nothing.
+  if [ "$is_revert" -eq 0 ]; then
+    scope_ref=$(extract_scope_ref "$subject")
+    if [ -n "$scope_ref" ]; then
+      case "$scope_ref" in
+        */*)
+          # Cross-repo scope (owner/repo#N) — never emit a bare #N derived
+          # from a foreign-repo reference (#207 lesson, reintroduced).
+          ;;
+        *)
+          issue_num="${scope_ref#\#}"
+          trailing_pr=$(extract_trailing_pr_num "$subject")
+          if [ -n "$trailing_pr" ]; then
+            pr_only="${trailing_pr#\#}"
+            if pr_body=$(fetch_pr_body "$pr_only"); then
+              if body_closes_issue "$pr_body" "$issue_num"; then
+                closes_nums+=("$issue_num")
+              fi
+            else
+              echo "WARN: could not fetch PR #${pr_only} body via ${RELEASE_GH}; falling back to scoped-title close for #${issue_num}" >&2
+              closes_nums+=("$issue_num")
+            fi
+          else
+            # No trailing (#PR) → nothing to fetch; prefer missing over reading
+            # the squash body (which is not the PR description). Warn so a
+            # direct-push author sees the missing close (#1506).
+            echo "WARN: scoped commit ${short_sha} has no trailing (#PR) in its subject; skipping close check for #${issue_num}" >&2
+          fi
+          ;;
+      esac
+    fi
+    # No scope at all -> no Closes line, regardless of any trailing "(#N)"
+    # squash-merge PR number and regardless of closing keywords in any body
+    # (#1076 + #1490: both gates required).
   fi
 
   # Classify by conventional-commit type
@@ -198,8 +485,19 @@ desc_parts=()
 [ "${#changed_lines[@]}" -gt 0 ] && desc_parts+=("${#changed_lines[@]} improvement$([ "${#changed_lines[@]}" -gt 1 ] && echo 's' || echo '')")
 
 if [ "${#desc_parts[@]}" -gt 0 ]; then
-  IFS=', '; release_desc="$bump_type — ${desc_parts[*]}."
-  IFS=$' \t\n'
+  # NB: `${arr[*]}` only joins on the FIRST character of IFS, even when IFS is
+  # set to a multi-char string like ', ' — that dropped the space and produced
+  # "2 features,13 fixes,14 improvements." on the v5.2.0 cut (#1002). Join
+  # explicitly instead of relying on IFS-based array expansion.
+  joined=""
+  for part in "${desc_parts[@]}"; do
+    if [ -z "$joined" ]; then
+      joined="$part"
+    else
+      joined="$joined, $part"
+    fi
+  done
+  release_desc="$bump_type — ${joined}."
 else
   release_desc="$bump_type."
 fi
@@ -242,10 +540,14 @@ if [ "${#closes_nums[@]}" -gt 0 ]; then
   echo ""
   echo "### Closes"
   echo ""
-  # Deduplicate and sort
-  unique_nums=$(printf '%s\n' "${closes_nums[@]}" | sort -un | tr '\n' ' ' | sed 's/ $//')
-  closes_str=""
-  for n in $unique_nums; do closes_str="${closes_str}#${n}, "; done
-  closes_str="${closes_str%, }"  # trim trailing comma+space
-  echo "- Closes $closes_str"
+  # #1056 — one "- Closes #N" bullet per reference, deduplicated and sorted.
+  # GitHub only honours the reference IMMEDIATELY FOLLOWING a closing
+  # keyword, so the old single "Closes #A, #B, #C" line auto-closed at most
+  # #A — every reference after the first was silently inert. Repeating the
+  # keyword (one bullet each) makes every reference its own closing directive.
+  unique_nums=$(printf '%s\n' "${closes_nums[@]}" | sort -un)
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    echo "- Closes #${n}"
+  done <<< "$unique_nums"
 fi

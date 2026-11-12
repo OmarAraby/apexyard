@@ -2,7 +2,7 @@
 
 # Templates
 
-ApexYard ships markdown templates under `templates/` that consuming skills read at invocation time — `/decide` reads `agdr.md`, `/write-spec` reads `prd.md`, `/c4` reads `architecture/c4-context.md` and `architecture/c4-container.md`, `/migration` reads `agdr-migration.md` (for the AgDR) AND `tickets/migration.md` (for the ticket body), `/spike` reads `tickets/spike.md`, `/investigation` reads `tickets/investigation.md`, `/feature` / `/bug` / `/task` / `/idea` read their matching files under `tickets/`, `/handover` reads `architecture/c4-container.md`. The full inventory is in [`CLAUDE.md` § "Templates"](../CLAUDE.md).
+ApexYard ships markdown templates under `templates/` that consuming skills read at invocation time — `/decide` reads `agdr.md`, `/write-spec` reads `prd.md`, `/c4` reads `architecture/c4-context.md` and `architecture/c4-container.md` (and `architecture/c4-structurizr.dsl` when invoked with `--dsl`), `/migration` reads `agdr-migration.md` (for the AgDR) AND `tickets/migration.md` (for the ticket body), `/spike` reads `tickets/spike.md`, `/investigation` reads `tickets/investigation.md`, `/feature` / `/bug` / `/task` / `/idea` read their matching files under `tickets/`, `/handover` reads `architecture/c4-container.md`. The full inventory is in [`CLAUDE.md` § "Templates"](../CLAUDE.md).
 
 ## `tickets/` subdir — uniform ticket body templates (since #281)
 
@@ -11,6 +11,12 @@ Every ticket-creating skill (`/feature`, `/bug`, `/task`, `/migration`, `/idea`,
 Prior to #281, the 5 older skills (`/feature`, `/bug`, `/task`, `/migration`, `/idea`) constructed their issue body inline via heredoc; only `/spike` and `/investigation` shipped a real template file. That meant a `<private_repo>/custom-templates/feature.md` override silently failed — the framework had no template file at the mirrored path for the override to win over. #281 closes that gap by adding the missing 5 template files and refactoring the 5 skills to resolve via `portfolio_resolve_template tickets/<name>.md`.
 
 **Backward-compat fallback**: if the resolved template file is missing (partial adopter setup), each skill falls back to its inline heredoc body and prints a one-line WARN on stderr. This preserves the pre-#281 behaviour for installations whose `templates/tickets/` dir is missing.
+
+## Required core and controlled technical writing profile (since #1164)
+
+Each artifact template tells its writer to use the controlled technical writing profile. The core templates (`prd.md`, `technical-design.md`, and the feature, bug, and task ticket templates) also open with a guidance comment that names their **Required** and **Conditional** sections. A completed artifact keeps every required section (write `TBD` for an unknown value), deletes every conditional section that has no content, and removes the guidance comment and every placeholder before it is filed. "N/A", "None", and empty tables do not appear in a finished artifact. The rule and its rationale: [`.claude/rules/writing-standard.md`](../.claude/rules/writing-standard.md) (AgDR-0134).
+
+Adopter overrides can carry the same comment. The skills read it at render time, so no skill change is needed for an override to adopt the convention.
 
 ## Adopter overrides — the `custom-templates/` layer
 
@@ -30,6 +36,7 @@ Every framework template can be overridden by an adopter-authored version. The o
 | `templates/tickets/investigation.md` | `<private_repo>/custom-templates/tickets/investigation.md` |
 | `templates/architecture/c4-context.md` | `<private_repo>/custom-templates/architecture/c4-context.md` |
 | `templates/architecture/c4-container.md` | `<private_repo>/custom-templates/architecture/c4-container.md` |
+| `templates/architecture/c4-structurizr.dsl` | `<private_repo>/custom-templates/architecture/c4-structurizr.dsl` |
 | `templates/architecture/vision.md` | `<private_repo>/custom-templates/architecture/vision.md` |
 | any nested file `templates/<a>/<b>/<c>.md` | `<private_repo>/custom-templates/<a>/<b>/<c>.md` |
 

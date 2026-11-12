@@ -12,6 +12,12 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+export CLAUDE_CODE_SESSION_ID=marker-test
+
+
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 HOOK="$REPO_ROOT/.claude/hooks/validate-issue-structure.sh"
 
@@ -41,6 +47,8 @@ YAML
 # Copy the real defaults + lib so the hook reads real schema.
 cp "$REPO_ROOT/.claude/project-config.defaults.json" "$TMPDIR/fork/.claude/project-config.defaults.json"
 cp "$REPO_ROOT/.claude/hooks/_lib-read-config.sh" "$TMPDIR/fork/.claude/hooks/_lib-read-config.sh"
+cp "$(cd "$(dirname "$0")/.." && pwd)/_lib-session-markers.sh" "$TMPDIR/fork/.claude/hooks/_lib-session-markers.sh"
+cp "$REPO_ROOT/.claude/hooks/_lib-flag-value.sh" "$TMPDIR/fork/.claude/hooks/_lib-flag-value.sh"
 
 # Build a JSON tool_input payload.
 make_payload() {
@@ -428,7 +436,7 @@ export APEXYARD_OPS_DISABLE_PIN=1
 # per-case so it never leaks into the schema cases above.
 touch "$TMPDIR/fork/.apexyard-fork"
 mkdir -p "$TMPDIR/fork/.claude/session"
-MARKER="$TMPDIR/fork/.claude/session/active-issue-skill"
+MARKER="$TMPDIR/fork/.claude/session/active-issue-skill.marker-test"
 
 # A [Feature] body in the framework-request template — MISSING the project
 # [Feature] schema (User Story + Acceptance Criteria) by design.
@@ -474,6 +482,36 @@ run_case "Framework-shaped [Feature], no active-issue-skill marker → still blo
 
 # Remove the v2 anchor so it can't influence any later cases.
 rm -f "$TMPDIR/fork/.apexyard-fork"
+
+# ---------------------------------------------------------------------------
+# Drift guard (me2resh/apexyard#964)
+#
+# The hook carries an INLINE fallback whitelist for bare checkouts that predate
+# config (`PREFIX_WHITELIST="Feature Bug ..."`). That fallback is a hand-copied
+# mirror of `.ticket.prefix_whitelist` in project-config.defaults.json and had
+# silently drifted (missing Prototype/Investigation/Migration/Idea) — so a
+# `[Migration]`/`[Idea]` ticket filed on a config-less checkout was wrongly
+# rejected. This assertion fails loudly the next time the two lists diverge,
+# instead of leaving the drift to be discovered by a mis-rejected ticket.
+# ---------------------------------------------------------------------------
+DEFAULTS_JSON="$REPO_ROOT/.claude/project-config.defaults.json"
+# The hook's inline fallback: grep the assignment, strip to the quoted value,
+# then normalise whitespace → newline-per-token → sort.
+fallback_sorted=$(
+  grep -E 'PREFIX_WHITELIST="[^"]+"' "$HOOK" \
+    | sed -E 's/.*PREFIX_WHITELIST="([^"]+)".*/\1/' \
+    | tr ' ' '\n' | grep -v '^$' | sort
+)
+defaults_sorted=$(jq -r '.ticket.prefix_whitelist[]' "$DEFAULTS_JSON" | sort)
+if [ "$fallback_sorted" = "$defaults_sorted" ]; then
+  echo "PASS: inline fallback whitelist matches .ticket.prefix_whitelist in defaults"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: inline fallback whitelist has drifted from .ticket.prefix_whitelist" >&2
+  echo "  hook fallback : $(echo "$fallback_sorted" | tr '\n' ' ')" >&2
+  echo "  defaults json : $(echo "$defaults_sorted" | tr '\n' ' ')" >&2
+  FAIL=$((FAIL + 1))
+fi
 
 # ---------------------------------------------------------------------------
 # Result

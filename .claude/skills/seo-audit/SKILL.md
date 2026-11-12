@@ -6,6 +6,8 @@ argument-hint: "[project-path]"
 effort: medium
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /seo-audit — Technical SEO Analysis
 
 Deep-dive SEO audit against Google's best practices. Checks on-page SEO, technical SEO, and social sharing metadata. Invoke when `/launch-check`'s SEO row shows WARN or FAIL.

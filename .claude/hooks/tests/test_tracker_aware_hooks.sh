@@ -17,6 +17,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # Pin isolation: per-project tracker resolution (#670) reads the ops-root
 # session pin to find the registry. Run interactively inside a live apexyard
 # session, the pin resolves PAST each mktemp sandbox to the operator's real
@@ -70,6 +75,8 @@ YAML
     cp "$TRACKER_LIB"   .claude/hooks/_lib-tracker.sh
     cp "$CONFIG_LIB"    .claude/hooks/_lib-read-config.sh
     cp "$PR_CREATE_HOOK"   .claude/hooks/validate-pr-create.sh
+    cp "$(dirname "$PR_CREATE_HOOK")/_lib-awk-fallback.sh" .claude/hooks/_lib-awk-fallback.sh
+    cp "$(dirname "$PR_CREATE_HOOK")/_lib-review-markers.sh" .claude/hooks/
     cp "$COMMIT_REFS_HOOK" .claude/hooks/verify-commit-refs.sh
     cp "$BRANCH_NAME_HOOK" .claude/hooks/validate-branch-name.sh
     chmod +x .claude/hooks/*.sh
@@ -97,10 +104,21 @@ YAML
 install_mock() {
   local sb="$1" name="$2" body="$3"
   mkdir -p "$sb/bin"
-  cat > "$sb/bin/$name" <<EOF
+  if [[ "$body" =~ ^exit\ [0-9]+$ ]]; then
+    printf '%s\n' "${body#exit }" > "$sb/mock-$name-exit"
+    cat > "$sb/bin/$name" <<'EOF'
+#!/bin/bash
+sb=${0%/bin/*}
+name=${0##*/}
+IFS= read -r code < "$sb/mock-$name-exit"
+exit "$code"
+EOF
+  else
+    cat > "$sb/bin/$name" <<EOF
 #!/bin/bash
 $body
 EOF
+  fi
   chmod +x "$sb/bin/$name"
 }
 
@@ -178,6 +196,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(#42): add csv export" --body "
+## Summary
+Sample change.
+
 ## Testing
 verify
 
@@ -185,6 +206,7 @@ verify
 | Term | Definition |
 |------|------------|
 | CSV | Comma-separated values |
+Refs #1
 " --head feature/GH-1-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "regression: default gh adopter — valid PR title passes"
@@ -206,6 +228,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(#9999): missing ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -213,6 +238,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/GH-1-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "regression: default gh adopter — fabricated #N blocks"
@@ -246,6 +272,9 @@ exit 0
 '
 # Linear: no --repo flag in command; PR is still gh-shaped (gh pr create).
 cmd='gh pr create --title "feat(LIN-42): linear ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -253,6 +282,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-42-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "linear: end-to-end — valid LIN-42 PR title passes via mock linear CLI"
@@ -269,6 +299,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(LIN-50): linear closed" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -276,6 +309,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-50-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "linear: closed-state (Done) → blocked"
@@ -293,6 +327,9 @@ fi
 # gh fabricated #N still blocks — see Case 12.)
 install_mock "$SB" linear 'exit 1'
 cmd='gh pr create --title "feat(LIN-99): unqueryable" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -300,6 +337,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-99-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "linear: tracker CLI returns empty → shape-only PASS (#501; was block pre-#501)"
@@ -331,6 +369,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(JIRA-100): jira ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -338,6 +379,7 @@ x
 | Term | Definition |
 |------|------------|
 | JIRA | Atlassian Jira |
+Refs #1
 " --head feature/JIRA-100-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "jira: end-to-end — valid JIRA-100 PR title passes via mock jira CLI"
@@ -354,6 +396,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(JIRA-200): jira closed" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -361,6 +406,7 @@ x
 | Term | Definition |
 |------|------------|
 | JIRA | Atlassian Jira |
+Refs #1
 " --head feature/JIRA-200-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "jira: closed-state (Resolved) → blocked"
@@ -389,6 +435,9 @@ JSON
 install_mock "$SB" gh 'exit 99'
 
 cmd='gh pr create --title "feat(#99999): no-tracker mode" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -396,6 +445,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/GH-99999-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "none: existence check short-circuited (no CLI call made)"
@@ -436,6 +486,9 @@ printf "{\"state\":\"open\",\"title\":\"mock %s\",\"url\":\"https://my/%s\",\"la
 exit 0
 '
 cmd='gh pr create --title "feat(TIC-7): custom" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -443,6 +496,7 @@ x
 | Term | Definition |
 |------|------------|
 | TIC | Custom tracker |
+Refs #1
 " --head feature/TIC-7-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "custom: end-to-end — operator-supplied command works"
@@ -549,7 +603,7 @@ cat > "$SB/.claude/project-config.json" <<'JSON'
 }
 JSON
 install_mock "$SB" linear '
-printf "{\"state\":{\"name\":\"In Progress\"},\"title\":\"L1\",\"url\":\"https://l/1\",\"labels\":[{\"name\":\"a\"},{\"name\":\"b\"}]}\n"
+printf "{\"state\":{\"name\":\"In Progress\"},\"title\":\"L1\",\"url\":\"https://l/1\",\"labels\":[{\"name\":\"a\"},{\"name\":\"b\"}],\"description\":\"see docs/agdr/AgDR-0001-schema-migration.md\"}\n"
 exit 0
 '
 out=$(
@@ -562,10 +616,12 @@ out=$(
 )
 got_state=$(echo "$out" | jq -r '.state')
 got_labels=$(echo "$out" | jq -r '.labels | join(",")')
-if [ "$got_state" = "In Progress" ] && [ "$got_labels" = "a,b" ]; then
-  record_pass "lib: tracker_view (linear) flattens state.name + label objects"
+got_body=$(echo "$out" | jq -r '.body')
+# body must survive (#761) — the migration gate reads .description for the AgDR link.
+if [ "$got_state" = "In Progress" ] && [ "$got_labels" = "a,b" ] && echo "$got_body" | grep -q "AgDR-0001-schema-migration.md"; then
+  record_pass "lib: tracker_view (linear) flattens state.name + label objects, maps description→body"
 else
-  record_fail "lib: tracker_view (linear) flattens state.name + label objects" "got state='$got_state' labels='$got_labels'"
+  record_fail "lib: tracker_view (linear) flattens state.name + label objects, maps description→body" "got state='$got_state' labels='$got_labels' body='$got_body'"
 fi
 rm -rf "$SB"
 
@@ -579,8 +635,11 @@ cat > "$SB/.claude/project-config.json" <<'JSON'
   }
 }
 JSON
+# Jira Cloud returns .fields.description as ADF (a JSON object, not a string).
+# The adapter must flatten ADF text leaves so body stays grep-able (#761) —
+# otherwise the migration gate could never see the AgDR link.
 install_mock "$SB" jira '
-printf "{\"self\":\"https://j/1\",\"fields\":{\"status\":{\"name\":\"To Do\"},\"summary\":\"S1\",\"labels\":[\"x\",\"y\"]}}\n"
+printf "{\"self\":\"https://j/1\",\"fields\":{\"status\":{\"name\":\"To Do\"},\"summary\":\"S1\",\"labels\":[\"x\",\"y\"],\"description\":{\"type\":\"doc\",\"version\":1,\"content\":[{\"type\":\"paragraph\",\"content\":[{\"type\":\"text\",\"text\":\"see docs/agdr/AgDR-0002-schema-migration.md\"}]}]}}}\n"
 exit 0
 '
 out=$(
@@ -594,10 +653,122 @@ out=$(
 got_state=$(echo "$out" | jq -r '.state')
 got_title=$(echo "$out" | jq -r '.title')
 got_labels=$(echo "$out" | jq -r '.labels | join(",")')
-if [ "$got_state" = "To Do" ] && [ "$got_title" = "S1" ] && [ "$got_labels" = "x,y" ]; then
-  record_pass "lib: tracker_view (jira) reads .fields.status.name + summary + labels"
+got_body=$(echo "$out" | jq -r '.body')
+if [ "$got_state" = "To Do" ] && [ "$got_title" = "S1" ] && [ "$got_labels" = "x,y" ] && echo "$got_body" | grep -q "AgDR-0002-schema-migration.md"; then
+  record_pass "lib: tracker_view (jira) reads status/summary/labels + flattens ADF description→body"
 else
-  record_fail "lib: tracker_view (jira) reads .fields.status.name + summary + labels" "got state='$got_state' title='$got_title' labels='$got_labels'"
+  record_fail "lib: tracker_view (jira) reads status/summary/labels + flattens ADF description→body" "got state='$got_state' title='$got_title' labels='$got_labels' body='$got_body'"
+fi
+
+# Jira Server / Data Center returns .fields.description as a plain string — the
+# string branch must pass it through verbatim (not swallow it via ADF flatten).
+install_mock "$SB" jira '
+printf "{\"self\":\"https://j/2\",\"fields\":{\"status\":{\"name\":\"Open\"},\"summary\":\"S2\",\"labels\":[],\"description\":\"link docs/agdr/AgDR-0003-data-migration.md here\"}}\n"
+exit 0
+'
+got_body=$(
+  cd "$SB" || exit 99
+  PATH="$SB/bin:$PATH"
+  . .claude/hooks/_lib-read-config.sh
+  . .claude/hooks/_lib-tracker.sh
+  tracker_clear_cache
+  tracker_view JIRA-2 | jq -r '.body'
+)
+if echo "$got_body" | grep -q "AgDR-0003-data-migration.md"; then
+  record_pass "lib: tracker_view (jira) passes through a plain-string (Server/DC) description→body"
+else
+  record_fail "lib: tracker_view (jira) passes through a plain-string (Server/DC) description→body" "got body='$got_body'"
+fi
+rm -rf "$SB"
+
+# Asana lib smoke (#761): body maps to .notes (plain-text task description). No
+# lib-level asana test existed before body was mapped — add one alongside the
+# linear/jira siblings so the migration gate's read of .notes is covered.
+SB=$(make_fork)
+cat > "$SB/.claude/project-config.json" <<'JSON'
+{
+  "tracker": {
+    "kind": "asana",
+    "view_command": "asana task get {id} --json"
+  }
+}
+JSON
+install_mock "$SB" asana '
+printf "{\"data\":{\"name\":\"A1\",\"completed\":false,\"permalink_url\":\"https://asana/1\",\"tags\":[{\"name\":\"backend\"}],\"notes\":\"rollback in docs/agdr/AgDR-0004-schema-migration.md\"}}\n"
+exit 0
+'
+out=$(
+  cd "$SB" || exit 99
+  PATH="$SB/bin:$PATH"
+  . .claude/hooks/_lib-read-config.sh
+  . .claude/hooks/_lib-tracker.sh
+  tracker_clear_cache
+  tracker_view 12345
+)
+got_state=$(echo "$out" | jq -r '.state')
+got_labels=$(echo "$out" | jq -r '.labels | join(",")')
+got_body=$(echo "$out" | jq -r '.body')
+if [ "$got_state" = "Open" ] && [ "$got_labels" = "backend" ] && echo "$got_body" | grep -q "AgDR-0004-schema-migration.md"; then
+  record_pass "lib: tracker_view (asana) derives Open from completed + maps notes→body"
+else
+  record_fail "lib: tracker_view (asana) derives Open from completed + maps notes→body" "got state='$got_state' labels='$got_labels' body='$got_body'"
+fi
+rm -rf "$SB"
+
+# Glab lib smoke (#755): global kind=glab with NO view_command exercises the
+# kind-aware built-in default (glab is first-class alongside gh — a glab adopter
+# only sets `kind`). GitLab-shaped JSON (state "opened", web_url, description)
+# normalises to {state:OPEN, url, body, labels[]}. body must survive because the
+# migration gate reads it for the linked AgDR.
+SB=$(make_fork)
+cat > "$SB/.claude/project-config.json" <<'JSON'
+{ "tracker": { "kind": "glab" } }
+JSON
+install_mock "$SB" glab '
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf "{\"state\":\"opened\",\"title\":\"GL1\",\"web_url\":\"https://gitlab/g/p/-/issues/1\",\"description\":\"see docs/agdr/AgDR-0001-schema-migration.md\",\"labels\":[\"migration\",\"backend\"]}\n"
+  exit 0
+fi
+exit 0
+'
+out=$(
+  cd "$SB" || exit 99
+  PATH="$SB/bin:$PATH"
+  . .claude/hooks/_lib-read-config.sh
+  . .claude/hooks/_lib-tracker.sh
+  tracker_clear_cache
+  tracker_view 1 g/p
+)
+got_state=$(echo "$out" | jq -r '.state')
+got_url=$(echo "$out" | jq -r '.url')
+got_body=$(echo "$out" | jq -r '.body')
+got_labels=$(echo "$out" | jq -r '.labels | join(",")')
+if [ "$got_state" = "OPEN" ] && [ "$got_url" = "https://gitlab/g/p/-/issues/1" ] && [ "$got_labels" = "migration,backend" ] && echo "$got_body" | grep -q "AgDR-0001-schema-migration.md"; then
+  record_pass "lib: tracker_view (glab) normalises opened→OPEN, web_url→url, description→body"
+else
+  record_fail "lib: tracker_view (glab) normalises opened→OPEN, web_url→url, description→body" "got state='$got_state' url='$got_url' body='$got_body' labels='$got_labels'"
+fi
+
+# Glab closed-state → CLOSED.
+install_mock "$SB" glab '
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf "{\"state\":\"closed\",\"title\":\"done\",\"web_url\":\"https://gitlab/g/p/-/issues/2\",\"description\":\"\",\"labels\":[]}\n"
+  exit 0
+fi
+exit 0
+'
+got_state=$(
+  cd "$SB" || exit 99
+  PATH="$SB/bin:$PATH"
+  . .claude/hooks/_lib-read-config.sh
+  . .claude/hooks/_lib-tracker.sh
+  tracker_clear_cache
+  tracker_view 2 g/p | jq -r '.state'
+)
+if [ "$got_state" = "CLOSED" ]; then
+  record_pass "lib: tracker_view (glab) normalises closed→CLOSED"
+else
+  record_fail "lib: tracker_view (glab) normalises closed→CLOSED" "got state='$got_state'"
 fi
 rm -rf "$SB"
 
@@ -621,6 +792,37 @@ else
 fi
 rm -rf "$SB"
 
+# Injection defence-in-depth (#755 security review): tracker_view builds its
+# command via string substitution and runs it through `eval`, so a caller that
+# forwards an unvalidated id must not be able to inject command syntax.
+# _tracker_substitute now printf %q-quotes the {id}/{owner_repo} tokens — verify a
+# metacharacter-laden id neither executes nor produces output, and that a
+# legitimate id still substitutes cleanly (no behaviour change for real values).
+SB=$(make_fork)
+install_mock "$SB" gh 'exit 0'   # any output irrelevant; we assert no execution
+rc=$(
+  cd "$SB" || exit 99
+  PATH="$SB/bin:$PATH"
+  . .claude/hooks/_lib-read-config.sh
+  . .claude/hooks/_lib-tracker.sh
+  tracker_clear_cache
+  tracker_view "1; touch $SB/LIB_PWNED ;" owner/repo >/dev/null 2>&1
+  echo $?
+)
+sub=$(
+  cd "$SB" || exit 99
+  . .claude/hooks/_lib-read-config.sh
+  . .claude/hooks/_lib-tracker.sh
+  tracker_clear_cache
+  _tracker_substitute 'gh issue view {id} --repo {owner_repo}' 42 owner/repo
+)
+if [ ! -e "$SB/LIB_PWNED" ] && [ "$sub" = "gh issue view 42 --repo owner/repo" ]; then
+  record_pass "lib: tracker_view neutralises injection via printf %q (metachar id not executed; legit id unchanged)"
+else
+  record_fail "lib: tracker_view neutralises injection via printf %q" "pwned=$([ -e "$SB/LIB_PWNED" ] && echo yes || echo no) legit-sub='$sub'"
+fi
+rm -rf "$SB"
+
 # =============================================================================
 # Case 10 (#501): non-gh tracker, CLI absent / returns empty → shape-only
 # fallback. The existence check can't run (no working CLI), so a well-formed
@@ -641,6 +843,9 @@ JSON
 # queryable from this environment) — tracker_view returns empty.
 install_mock "$SB" linear 'exit 1'
 cmd='gh pr create --title "feat(LIN-77): real linear ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -648,6 +853,7 @@ x
 | Term | Definition |
 |------|------------|
 | LIN | Linear |
+Refs #1
 " --head feature/LIN-77-test'
 if run_pr_hook "$SB" "$cmd" 0; then
   record_pass "#501 pr-create: non-gh tracker not queryable → shape-only PASS (no block)"
@@ -686,6 +892,9 @@ JSON
 install_mock "$SB" linear 'exit 1'
 # Malformed title: no ticket ref in the type(TICKET): shape → must block (exit 2).
 cmd='gh pr create --title "feat: missing ticket parens" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -693,6 +902,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/LIN-1-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "#501 pr-create: ill-formed title still fails shape check under non-gh tracker"
@@ -716,6 +926,9 @@ fi
 exit 0
 '
 cmd='gh pr create --title "feat(#88888): missing gh ticket" --body "
+## Summary
+Sample change.
+
 ## Testing
 x
 
@@ -723,6 +936,7 @@ x
 | Term | Definition |
 |------|------------|
 | x | x |
+Refs #1
 " --head feature/GH-1-test'
 if run_pr_hook "$SB" "$cmd" 2; then
   record_pass "#501 pr-create: gh tracker fabricated #N still BLOCKS (gh behaviour unchanged)"

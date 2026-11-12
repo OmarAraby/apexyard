@@ -10,6 +10,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 HOOK="$REPO_ROOT/.claude/hooks/require-agdr-for-arch-pr.sh"
@@ -261,8 +266,7 @@ spike_marker_setup() {
     cd "$dir" || exit 1
     echo "version: 1
 projects: []" > apexyard.projects.yaml
-    mkdir -p .claude/session
-    cat > .claude/session/current-ticket <<'EOF'
+    cat > .git/apexyard-ticket <<'EOF'
 repo=test/repo
 number=180
 title=[Spike] active-marker exemption test
@@ -306,14 +310,75 @@ run_case "prototype branch name (arch change, no AgDR, non-prototype PR title) �
   "$DIR" 0 "spike/prototype PR detected" \
   "gh pr create --base main --title 'feat(#673): tweak domain' --body 'just exploring UX'"
 
-# Prototype signal (b): active-ticket marker referencing a [Prototype] ticket
-# is supported by the hook (see require-agdr-for-arch-pr.sh — the marker grep
-# matches `^title=\[(Spike|Prototype)\]`). It is NOT asserted here because it
-# shares the same in-sandbox ops-root resolution limitation as the pre-existing
-# "spike active-ticket marker" case above (the marker fixture's ops root isn't
-# resolved inside the test sandbox). Signals (a) PR-title-type and (c)
-# branch-name — both exercised above — give the prototype exemption equivalent
-# coverage to the spike exemption's reliably-green signals.
+# Prototype signal (b): the tree's own marker names a [Prototype] ticket.
+prototype_marker_setup() {
+  local dir
+  dir=$(spike_marker_setup)
+  sed -i.bak 's/^title=.*/title=[Prototype] active-marker exemption test/' "$dir/.git/apexyard-ticket"
+  rm -f "$dir/.git/apexyard-ticket.bak"
+  echo "$dir"
+}
+
+DIR=$(prototype_marker_setup)
+run_case "prototype active-ticket marker (arch change, non-prototype branch + title) → PASS via marker signal" \
+  "$DIR" 0 "spike/prototype PR detected" \
+  "gh pr create --base main --title 'feat(#673): tweak domain' --body 'no AgDR'"
+
+# A spike marker in one project must not exempt a change in another project.
+# The ops fork registers projects a and b. Project a holds the spike marker.
+# The PR change is in project b, which has no marker of its own.
+spike_cross_project_setup() {
+  local mode="${1:-new}" ops b a
+  ops=$(mktemp -d -t agdr-pr-ops.XXXXXX)
+  b=$(setup_repo c1_base c1_feat)
+  (
+    cd "$ops" || exit 1
+    git init -q -b main
+    git config user.email t@t.test
+    git config user.name test
+    : > .apexyard-fork
+    : > onboarding.yaml
+    printf 'projects:\n  - name: a\n    repo: test/a\n  - name: b\n    repo: test/b\n' > apexyard.projects.yaml
+    git add .apexyard-fork onboarding.yaml apexyard.projects.yaml
+    git commit -q -m init
+    mkdir -p workspace
+  )
+  mv "$b" "$ops/workspace/b"
+  a="$ops/workspace/a"
+  git init -q -b main "$a"
+  git -C "$a" config user.email t@t.test
+  git -C "$a" config user.name test
+  git -C "$a" commit -q --allow-empty -m init
+  # Where project a's spike ticket lives. The two old locations are the ones
+  # the merge base scanned for any [Spike] title, whatever the project.
+  mkdir -p "$ops/.claude/session/tickets"
+  case "$mode" in
+    old-tickets) printf 'repo=test/a\nnumber=1\ntitle=[Spike] other project\n' > "$ops/.claude/session/tickets/a" ;;
+    old-current) printf 'repo=test/a\nnumber=1\ntitle=[Spike] other project\n' > "$ops/.claude/session/current-ticket" ;;
+    old-current-b) printf 'repo=test/a\nnumber=1\ntitle=[Spike] other project\n' > "$ops/.claude/session/current-ticket"
+      printf 'repo=test/b\nnumber=2\ntitle=Plain b ticket\n' > "$ops/.claude/session/tickets/b" ;;
+    *) printf 'repo=test/a\nnumber=1\ntitle=[Spike] other project\n' > "$a/.git/apexyard-ticket" ;;
+  esac
+  echo "$ops/workspace/b"
+}
+
+for mode in new old-tickets old-current-b; do
+  DIR=$(spike_cross_project_setup "$mode")
+  run_case "spike_marker_in_project_a_does_not_exempt_project_b ($mode marker, arch change in b) → BLOCK" \
+    "$DIR" 2 "AgDR" \
+    "gh pr create --base main --title 'feat(#180): tweak domain' --body 'no AgDR'"
+done
+# The old current-ticket is the marker that governs b when b has no marker
+# of its own, as in the ticket gate. Its spike title then exempts b.
+DIR=$(spike_cross_project_setup old-current)
+run_case "an old current-ticket that governs b exempts b → PASS" \
+  "$DIR" 0 "spike/prototype PR detected" \
+  "gh pr create --base main --title 'feat(#180): tweak domain' --body 'no AgDR'"
+DIR=$(spike_cross_project_setup)
+printf 'repo=test/b\nnumber=2\ntitle=[Spike] own marker\n' > "$DIR/.git/apexyard-ticket"
+run_case "project b with its own spike marker → PASS" \
+  "$DIR" 0 "spike/prototype PR detected" \
+  "gh pr create --base main --title 'feat(#180): tweak domain' --body 'no AgDR'"
 
 # ---------------------------------------------------------------------------
 # Regression: embedded-quote truncation bug (apexyard#461).
@@ -432,6 +497,61 @@ run_case "cd-target arch PR with AgDR ref → PASS [#669]" \
   "$FORK_DIR3" 0 "" \
   "cd $TGT_ARCH2 && gh pr create --base main --title 'feat(#7): portfolio domain' --body 'See AgDR-0009-portfolio-domain for rationale.'"
 rm -rf "$TGT_ARCH2"
+
+# ---------------------------------------------------------------------------
+# #769 bug 1 — diff-base resolves origin/<base> before upstream/<base>.
+# On a fork DIVERGED-behind upstream (its own baseline arch customisations that
+# upstream lacks), diffing against upstream/<base>'s merge-base attributes the
+# fork's OWN baseline files to the PR → false arch-block on a docs-only PR.
+# ---------------------------------------------------------------------------
+setup_diverged_fork() {
+  local dir; dir=$(mktemp -d -t agdr-b1.XXXXXX)
+  (
+    cd "$dir" || exit 1
+    git init -q -b main
+    git config user.email t@t.test; git config user.name test
+    echo "company: test" > onboarding.yaml
+    git add onboarding.yaml; git commit -q -m init
+    local p; p=$(git rev-parse HEAD)
+    # Fork baseline: a CI workflow the fork carries but upstream does not.
+    mkdir -p .github/workflows; echo "on: push" > .github/workflows/fork-custom.yml
+    git add .github/workflows/fork-custom.yml; git commit -q -m "fork: baseline ci"
+    git update-ref refs/remotes/origin/main HEAD       # origin/main = fork main
+    # upstream/main diverged from p — does NOT have the fork's workflow.
+    git checkout -q "$p"
+    echo "# upstream" > UPSTREAM.md; git add UPSTREAM.md; git commit -q -m "upstream: unrelated"
+    git update-ref refs/remotes/upstream/main HEAD
+    # Feature branch off the fork's main: docs only.
+    git checkout -q main; git checkout -q -b feature
+    mkdir -p docs; echo "# new" > docs/new.md
+    git add docs/new.md; git commit -q -m "docs: add"
+  )
+  echo "$dir"
+}
+
+B1_DIR=$(setup_diverged_fork)
+run_case "docs-only PR on a fork diverged-behind upstream → PASS (diffs origin/main, not upstream/main) [#769 bug1]" \
+  "$B1_DIR" 0 "" \
+  "gh pr create --base main --title 'docs(#9): update guide' --body 'Docs only. No decisions.'"
+
+# ---------------------------------------------------------------------------
+# #769 bug 2 — the skip marker (and any AgDR ref) inside a heredoc --body with
+# a trailing pipe is honoured. The --body extractor cannot recover a value that
+# spans newlines or is followed by a shell operator; the raw command is now part
+# of the haystack, so the marker is seen regardless of --body quoting shape.
+# ---------------------------------------------------------------------------
+B2_DIR=$(setup_repo c1_base c1_feat)   # feature touches src/domain/ (arch), no AgDR
+B2_CMD=$'gh pr create --base main --title "feat(#10): domain" --body "$(cat <<\'EOF\'\nSome body text.\n<!-- agdr: not-applicable -->\nEOF\n)" 2>&1 | tail -3'
+run_case "arch PR, skip-marker in a heredoc --body with trailing pipe → PASS (bypassed) [#769 bug2]" \
+  "$B2_DIR" 0 "not-applicable marker present" \
+  "$B2_CMD"
+
+# And the AgDR-reference path through the same heredoc+pipe shape → PASS.
+B2b_DIR=$(setup_repo c1_base c1_feat)
+B2b_CMD=$'gh pr create --base main --title "feat(#11): domain" --body "$(cat <<\'EOF\'\nSee AgDR-0009-portfolio-domain for the rationale.\nEOF\n)" 2>&1 | tail -3'
+run_case "arch PR, AgDR ref in a heredoc --body with trailing pipe → PASS [#769 bug2]" \
+  "$B2b_DIR" 0 "" \
+  "$B2b_CMD"
 
 # ---------------------------------------------------------------------------
 # Result

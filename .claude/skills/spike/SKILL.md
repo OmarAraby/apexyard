@@ -2,10 +2,13 @@
 name: spike
 description: Create a hypothesis-driven, time-boxed spike ticket (Hypothesis/Budget/Kill Criteria/Disposition). Exempt from AgDR + coverage gates.
 argument-hint: "<short title of the spike>"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # /spike — Create a Spike Ticket
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the spike
+ticket and disposition record. Keep the hypothesis and kill criteria concise.
 
 Creates a structured GitHub Issue for a **spike** — a 1-3 day hypothesis-driven exploration whose goal is to answer a technical question with minimum investment, with the explicit understanding that the code will be discarded or substantially rewritten once the answer is clear.
 
@@ -33,37 +36,39 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 0. Write the active-issue-skill marker (REQUIRED — me2resh/apexyard#268)
 
 Before any `gh issue create` (or other tracker CLI), write this skill's name to the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the command through. At skill entry:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "spike" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "spike" > "$skill_marker"
 ```
 
 Remove the marker on **every** exit path (success, early-exit, user cancel, error):
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers from killed sessions, but a clean exit should never leave one behind. See AgDR-0030.
+The `clear-issue-skill-marker.sh` SessionStart hook clears only the current session's marker, but a clean exit should never leave one behind. See AgDR-0030.
 
 ### 1. Resolve the target repo
 
-Read `.claude/session/current-ticket` to determine which repo we're working in. If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
+Read the active-ticket marker of the working tree you are in to determine which repo we're working in. The marker is the `apexyard-ticket` file in the git dir of that tree. See `/start-ticket` "Read the active ticket". If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
 
 ```
 Which project is this spike for?
@@ -130,6 +135,9 @@ Under what specific conditions does the spike STOP early?
 Encourage at least two kill criteria — one "answered: yes" and one "answered: no / unworkable". Don't accept "we'll figure it out".
 
 **d) Disposition (required — PROMOTE or DISCARD)**
+
+Use `AskUserQuestion` for this choice. Recommend `DISCARD` first and describe both effects.
+Use the prompt below only when the harness lacks the tool.
 
 ```
 What happens when the spike closes — PROMOTE or DISCARD?
@@ -210,26 +218,71 @@ Create this ticket? (yes / edit / cancel)
 - **edit** / **change X** → ask what to change, update, re-show
 - **cancel** / **no** → abort
 
-### 7. Create the GitHub Issue
+### 7. Create the issue (via the tracker abstraction)
+
+Dispatch creation through `tracker_create` (#670 / AgDR-0072, extended by
+the #709 creator sweep) so the spike lands in **this project's** tracker — GitHub,
+GitLab, or a `custom` CLI — per its `tracker:` block in `apexyard.projects.yaml`.
+For a GitHub adopter this runs `gh issue create` exactly as before.
 
 ```bash
-gh issue create --repo {owner/repo} \
-  --title "[Spike] {title}" \
-  --label "spike" \
-  --body "{formatted body}"
+# Resolve the tracker lib (it lives in the ops fork's hooks dir) by walking up
+# from the cwd; source it.
+tracker_lib="$(r="$PWD"; while [ -n "$r" ] && [ "$r" != / ]; do \
+  [ -f "$r/.claude/hooks/_lib-tracker.sh" ] && { echo "$r/.claude/hooks/_lib-tracker.sh"; break; }; \
+  r="${r%/*}"; done)"
+# shellcheck source=/dev/null
+. "$tracker_lib"
+
+# Ensure the `spike` trigger label exists on the target tracker. Best-effort
+# (tracker_label_ensure always exits 0) — a duplicate/missing label never aborts
+# the create. The label is what downstream hooks (AgDR-required hooks, coverage
+# gates) read to apply the spike workflow exemptions.
+tracker_label_ensure "{owner/repo}" "spike" "FBCA04" "Throw-away exploration; exempt from AgDR + coverage gates"
+
+# Pass the body via a file (arbitrary markdown — never inline-interpolated).
+body_file="$(mktemp)"
+cat > "$body_file" <<'BODY'
+{formatted body}
+BODY
+
+# tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
+# It is gated by require-skill-for-issue-create.sh; the active-issue-skill marker
+# written at skill entry keeps this call allowed.
+result="$(tracker_create "{owner/repo}" "[Spike] {title}" "$body_file" "spike")"
+rc=$?
+rm -f "$body_file"
+if [ "$rc" -eq 3 ]; then
+  # tracker.kind=none (shape-only): no tracker to create in. tracker_create
+  # printed the rendered ticket body to stdout — surface it for manual /
+  # external filing instead of a non-existent CLI/auth failure.
+  echo "Tracker is 'none' (shape-only) — nothing was created in a tracker." >&2
+  echo "File this in your external system (e.g. Jira/Linear via MCP):" >&2
+  printf '%s\n' "$result"
+  exit 0
+elif [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+  echo "Spike creation failed — check the tracker CLI / auth. Nothing was created." >&2
+  exit 1
+fi
+
+ref="$(printf '%s' "$result" | jq -r '.ref')"
+url="$(printf '%s' "$result" | jq -r '.url')"
 ```
 
-The `spike` label is the trigger that downstream hooks (AgDR-required hooks, coverage gates) read to apply the workflow exemptions. If the label doesn't exist on the target repo, the skill will create it via `gh label create spike --color "FBCA04" --description "Throw-away exploration; exempt from AgDR + coverage gates"` (idempotent — `gh label create` errors on duplicate, the skill swallows that).
+The `spike` label is the trigger that downstream hooks (AgDR-required hooks,
+coverage gates) read to apply the workflow exemptions.
 
 ### 8. Return the URL + branch suggestion
 
+Use the `ref` / `url` parsed from `tracker_create` in step 7:
+
 ```
-Created: {owner/repo}#{number} — {title}
-{url}
+Created: {owner/repo}#${ref} — {title}
+${url}
 
 When you start work:
-  /start-ticket {owner/repo}#{number}
-  git checkout -b spike/GH-{number}-{slug}
+  /start-ticket {owner/repo}#${ref}
+  git checkout -b spike/GH-${ref}-{slug}
 ```
 
 ### 9. Remind the operator about the disposition gate

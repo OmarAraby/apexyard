@@ -2,10 +2,13 @@
 name: migration
 description: Create a labelled migration ticket + matching migration AgDR — required by the migration gate.
 argument-hint: "[<project>]"
-allowed-tools: Bash, Read, Write
+allowed-tools: Bash, Read, Write, AskUserQuestion
 ---
 
 # /migration — Create a Migration Ticket + AgDR
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the
+migration ticket and AgDR. Lead with the outcome and keep required detail precise.
 
 Migrations are high-blast-radius: data loss, downtime, lock contention, cross-service coordination. ApexYard treats them as a distinct class of change from code — a migration PR needs:
 
@@ -30,7 +33,7 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 
 ```
 /migration                 # prompts for everything, creates ticket + AgDR in the current project
-/migration curios-dog      # explicitly target a registered project
+/migration sample-app      # explicitly target a registered project
 ```
 
 ## When to invoke
@@ -44,33 +47,35 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 0. Write the active-issue-skill marker (REQUIRED — me2resh/apexyard#268)
 
 Before any `gh issue create` (or other tracker CLI), write this skill's name to the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the command through. At skill entry:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "migration" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "migration" > "$skill_marker"
 ```
 
 Remove the marker on **every** exit path (success, early-exit, user cancel, error):
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers from killed sessions, but a clean exit should never leave one behind. See AgDR-0030.
+The `clear-issue-skill-marker.sh` SessionStart hook clears only the current session's marker, but a clean exit should never leave one behind. See AgDR-0030.
 
 ### 1. Resolve the target project
 
@@ -86,6 +91,8 @@ If the project isn't registered, stop — file one via `/handover` first, or pas
 ### 2. Gather the migration facts (conversational)
 
 Ask each of the following. Each answer feeds both the issue body and the AgDR — the skill writes them into both so the user never retypes.
+Use `AskUserQuestion` for the fields with listed choices. For a choice field such as migration type, recommend the best supported value first. For a factual field such as "Rollback tested against" or "Estimated downtime", do not recommend a value the operator has not confirmed. Put the most conservative value first (for example `not tested`), and recommend another value only when the conversation already holds evidence for it.
+Use the listed values as a numbered prose fallback only when the harness lacks the tool.
 
 1. **One-line summary** — goes in the ticket title: `[Migration] <type>: <summary>`
 2. **Migration type** — `schema | data | sql | orm` (pick one; if it straddles, use the most invasive)
@@ -215,36 +222,67 @@ migration-gate hook (`require-migration-ticket.sh`) verifies the
 `migration` label is present before allowing edits to migration files.
 ```
 
-Create via:
+Create via the tracker abstraction (`tracker_create`, #670 / AgDR-0072, extended
+by the #709 creator sweep) so the ticket lands in **this project's** tracker —
+GitHub, GitLab, or a `custom` CLI — per its `tracker:` block in
+`apexyard.projects.yaml`. For a GitHub adopter this runs `gh issue create`
+exactly as before.
 
 ```bash
-gh issue create \
-  --repo "<owner/repo>" \
-  --title "[Migration] <type>: <summary>" \
-  --label "migration" \
-  --label "<priority>" \
-  --body "$BODY"
+# Resolve the tracker lib (it lives in the ops fork's hooks dir) by walking up
+# from the cwd; source it.
+tracker_lib="$(r="$PWD"; while [ -n "$r" ] && [ "$r" != / ]; do \
+  [ -f "$r/.claude/hooks/_lib-tracker.sh" ] && { echo "$r/.claude/hooks/_lib-tracker.sh"; break; }; \
+  r="${r%/*}"; done)"
+# shellcheck source=/dev/null
+. "$tracker_lib"
+
+# $BODY was assembled above; hand it to tracker_create via a file (arbitrary
+# markdown — never inline-interpolated). Labels pass as a comma-separated list.
+body_file="$(mktemp)"
+printf '%s\n' "$BODY" > "$body_file"
+
+# tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
+result="$(tracker_create "<owner/repo>" "[Migration] <type>: <summary>" "$body_file" "migration,<priority>")"
+rc=$?
+rm -f "$body_file"
+if [ "$rc" -eq 3 ]; then
+  echo "Tracker is 'none' (shape-only) — nothing was created in a tracker." >&2
+  echo "File this in your external system (e.g. Jira/Linear via MCP):" >&2
+  printf '%s\n' "$result"
+  exit 0
+elif [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+  echo "Migration ticket creation failed — check the tracker CLI / auth. Nothing was created." >&2
+  exit 1
+fi
+
+# Capture the reference + URL for the AgDR back-fill below.
+ref="$(printf '%s' "$result" | jq -r '.ref')"
+url="$(printf '%s' "$result" | jq -r '.url')"
 ```
 
-Capture the returned URL and issue number.
+The `migration` label is what `require-migration-ticket.sh` reads to gate edits
+to migration files (Gate 3a). On GitHub it must already exist on the repo; on
+GitLab it is auto-created when first applied.
 
 ### 6. Back-fill the AgDR with the issue reference
 
-Open the AgDR written in step 4 and update:
+Open the AgDR written in step 4 and update (using the `ref` / `url` captured
+above):
 
-- Frontmatter `ticket: <owner/repo>#<number>`
-- The Artifacts section: add the ticket URL
+- Frontmatter `ticket: <owner/repo>#${ref}`
+- The Artifacts section: add the ticket `${url}`
 
 This lets a future reader land on the AgDR and find the ticket, and land on the ticket and find the AgDR.
 
 ### 7. Return a summary
 
-Single-line output:
+Single-line output (using the `ref` / `url` captured above):
 
 ```
-Migration ticket: <ticket-url>
+Migration ticket: ${url}
 Migration AgDR:   <relative-path-to-AgDR>
-Next step:        run /start-ticket <owner/repo>#<number>, then begin editing the migration files
+Next step:        run /start-ticket <owner/repo>#${ref}, then begin editing the migration files
 ```
 
 **Do NOT automatically run `/start-ticket`** — the user may have other context to set first, and the explicit handoff makes the workflow legible. The migration gate will block edits until the marker points at this ticket.

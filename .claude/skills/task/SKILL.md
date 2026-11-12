@@ -7,6 +7,8 @@ allowed-tools: Bash, Read, Write
 
 # /task — Create a Technical Task Ticket
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 Creates a structured GitHub Issue for a technical task with driver (why), scope (what), acceptance criteria, and risks. Used for tech debt, infrastructure, refactoring, dependency updates, or any non-user-facing work that doesn't fit /feature or /bug.
 
 ## Path resolution
@@ -36,32 +38,29 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 Before any `gh issue create` (or other tracker CLI), write this skill's name to the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the command through. At skill entry:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "task" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "task" > "$skill_marker"
 ```
 
 Remove the marker on **every** exit path (success, early-exit, user cancel, error):
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers from killed sessions, but a clean exit should never leave one behind. See AgDR-0030.
+The `clear-issue-skill-marker.sh` SessionStart hook clears only the current session's marker, but a clean exit should never leave one behind. See AgDR-0030.
 
 ### 1. Resolve the target repo
 
-Read `.claude/session/current-ticket` to determine which repo we're working in. If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
+Read the active-ticket marker of the working tree you are in to determine which repo we're working in. The marker is the `apexyard-ticket` file in the git dir of that tree. See `/start-ticket` "Read the active ticket". If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
 
 ```
 Which project is this task for?
@@ -128,6 +127,8 @@ Single-fork adopters (no `portfolio` block) and adopters with no override fall s
 
 **Backward-compat fallback**: if `portfolio_resolve_template` returns empty (template file missing — partial adopter setup), fall back to the inline heredoc body below and print a one-line WARN on stderr (`WARN: tickets/task.md template missing — using inline fallback`).
 
+Read `.claude/rules/writing-standard.md` before drafting. Treat the resolved template as the source of truth. Keep required sections, remove empty conditional sections, replace unknown required values with `TBD`, and delete the guidance comment before filing.
+
 ### 5. Show the formatted ticket for confirmation
 
 Substitute the gathered inputs into the resolved template (or the inline heredoc fallback), then display the full ticket using the resolved shape (the default `templates/tickets/task.md` shape is reproduced below):
@@ -136,7 +137,7 @@ Substitute the gathered inputs into the resolved template (or the inline heredoc
 Here's the ticket I'll create:
 
 ---
-**[{Chore|Refactor|Test|CI}] {title}**
+**[{Chore|Refactor|Testing|CI}] {title}**
 
 ## Driver
 {why this work is needed}
@@ -150,7 +151,7 @@ Here's the ticket I'll create:
 - [ ] ...
 
 ## Risks / Dependencies
-{risks or "None identified"}
+{include only when provided}
 
 ## Glossary
 | Term | Definition |
@@ -201,6 +202,11 @@ body_file="$(mktemp)"
 cat > "$body_file" <<'BODY'
 {formatted body}
 BODY
+
+# When ORBIT default planning is on, finish this Bash call here and print
+# the absolute body_file path. In the next Bash call, use that LITERAL path
+# in tracker_create and rm below. The PreToolUse gate must read the file
+# before the create call runs; it cannot resolve a shell variable at that time.
 
 # tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
 # It is gated by require-skill-for-issue-create.sh; the active-issue-skill

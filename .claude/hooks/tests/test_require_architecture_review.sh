@@ -13,6 +13,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 HOOK_SRC="$SRC_ROOT/.claude/hooks/require-architecture-review.sh"
 LIB_MARKERS="$SRC_ROOT/.claude/hooks/_lib-review-markers.sh"
@@ -99,6 +104,7 @@ make_sandbox() {
   mkdir -p "$sb/.claude/hooks" "$sb/.claude/session/reviews"
   # Copy libs needed by the hook.
   cp "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh" "$sb/.claude/hooks/_lib-extract-pr.sh"
+  cp "$(dirname "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
   cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
   if [ -f "$SRC_ROOT/.claude/hooks/_lib-ops-root.sh" ]; then
     cp "$SRC_ROOT/.claude/hooks/_lib-ops-root.sh" "$sb/.claude/hooks/_lib-ops-root.sh"
@@ -117,14 +123,24 @@ install_mock_gh() {
 #!/bin/bash
 args="\$*"
 case "\$args" in
-  *"pr diff"*"--name-only"*)
-    printf '%s\n' $diff_files
+  *"api"*"pulls/77"*"changed_files"*)
+    if [ "\${MOCK_LARGE:-0}" = 1 ]; then printf '%s\n' 3001; else printf '%s\n' 1; fi
+    ;;
+  *"api"*"pulls/"*"/files"*)
+    if [ "\${MOCK_LARGE:-0}" = 1 ]; then
+      seq 1 3001 | sed 's|^|src/file-|; s|$|.ts|'
+    else
+      printf '%s\n' $diff_files
+    fi
     ;;
   *"pr view"*headRefOid*)
     printf '%s\n' "$head_sha"
     ;;
   *"pr view"*headRepository*)
     printf '%s\n' "$repo"
+    ;;
+  *"pr view"*"--json number"*)
+    printf '%s\n' 77
     ;;
   *) exit 0 ;;
 esac
@@ -138,12 +154,32 @@ EOF
 run_gate() {
   local sb="$1" command="$2"
   local input
-  input=$(printf '{"tool_input":{"command":"%s"}}' "$command")
+  input=$(jq -nc --arg c "$command" '{tool_input:{command:$c}}')
   ( cd "$sb" && APEXYARD_OPS_DISABLE_PIN=1 PATH="$sb/bin:$PATH" bash "$HOOK_SRC" >/dev/null 2>&1 <<< "$input" )
   echo $?
 }
 
+# #1525: data-only heredocs pass, but executable bodies still reach the gate.
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+code=$(run_gate "$sb" $'cat <<\'EOF\'\ngh pr merge 315 --repo $R\nEOF')
+assert_eq "#1525 quoted data heredoc passes" "0" "$code"
+code=$(run_gate "$sb" $'sh <<\'EOF\'\ngh pr merge $PR --repo $R\nEOF')
+assert_eq "#1525 sh heredoc variable blocks" "2" "$code"
+rm -rf "$sb"
+
 SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+# B1: the branch PR has a matching architecture approval. An argv merge of
+# another PR or a runtime value must not inherit that approval.
+for argv_target in "'5'" "os.environ['PR']"; do
+  sb=$(make_sandbox)
+  install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
+  printf '%s\n' "$SHA" > "$(review_marker_path "o/r" 77 architecture "$sb")"
+  code=$(run_gate "$sb" "python3 -c \"import subprocess, os; subprocess.run(['gh','pr','merge',$argv_target])\"")
+  assert_eq "argv merge target $argv_target does not use approved branch PR" "2" "$code"
+  rm -rf "$sb"
+done
 
 echo ""
 echo "B) design-artifact PR + NO marker -> BLOCK (exit 2)"
@@ -248,13 +284,14 @@ args="\$*"
 case "\$args" in
   *"--repo $portfolio"*|*"repos/$portfolio/"*)
     case "\$args" in
-      *"pr diff"*"--name-only"*) printf '%s\n' $diff_files ;;
+      *"pulls/77"*"changed_files"*) printf '%s\n' 1 ;;
+      *"pulls/77/files"*) printf '%s\n' $diff_files ;;
       *"pr view"*headRefOid*)    printf '%s\n' "$head_sha" ;;
       *"pr view"*headRepository*) printf '%s\n' "$portfolio" ;;
       *) exit 0 ;;
     esac
     ;;
-  *"pr diff"*"--name-only"*) ;;    # bare → no files (ops-fork resolution)
+  *"pulls/77/files"*) ;;    # bare → no files (ops-fork resolution)
   *"pr view"*headRefOid*) ;;        # bare → empty
   *) exit 0 ;;
 esac
@@ -291,6 +328,193 @@ printf '%s\n' "$SHA" > "$(review_marker_path "me2resh/ops-fork" 77 architecture 
 code=$(run_gate "$sb" "cd $pf && gh pr merge 77 --squash")
 assert_eq "#687 wrong-qualifier marker still blocks" "2" "$code"
 rm -rf "$sb" "$pf"
+
+echo ""
+echo "E) #1091/#1099 sibling: forge HEAD unresolvable -> the gate must FAIL CLOSED"
+#
+# require-architecture-review.sh carried the SAME local-HEAD fallback that
+# block-unreviewed-merge.sh had (see #1091, fixed for all three gates by
+# #1098, which shipped a regression test only for block-unreviewed-merge.sh).
+# This is the missing discriminating case for THIS gate (#1099), built on the
+# exact construction from test_block_unreviewed_merge.sh's #1091 case
+# (~line 832): the mock gh answers `pr diff` (a design artifact is found)
+# and `pr view ... headRepository`, but FAILS `pr view ... headRefOid` — the
+# one call resolve_pr_head makes. `headRefName` is also wired to answer even
+# though this hook never queries it, mirroring the sibling gate's mock so the
+# "forge reachable but this ONE field is missing" shape is explicit rather
+# than "the whole gh binary is gone".
+#
+# DISCRIMINATING BY CONSTRUCTION: the marker is written to match THIS
+# sandbox's LOCAL HEAD (`git rev-parse HEAD`) — the value the pre-#1098
+# fallback would have substituted for the unresolvable forge HEAD. Under the
+# removed fallback that makes the SHA comparison succeed and the merge
+# ALLOWED (rc=0). Under fail-closed it is BLOCKED (rc=2) regardless of what
+# the local HEAD says. A marker at a MISMATCHING local HEAD would block both
+# before and after, proving nothing — the exact trap #1099's own issue body
+# calls out.
+
+install_mock_gh_headrefoid_fails() {
+  local sb="$1" diff_files="$2" repo="${3:-o/r}"
+  mkdir -p "$sb/bin"
+  cat > "$sb/bin/gh" <<EOF
+#!/bin/bash
+args="\$*"
+case "\$args" in
+  *"pulls/"*"/files"*)
+    if [ "${MOCK_LARGE:-0}" = 1 ]; then
+      seq 1 3001 | sed 's|^|src/file-|; s|$|.ts|'
+    else
+      printf '%s\n' $diff_files
+    fi
+    ;;
+  *"pr view"*headRefOid*)
+    exit 1
+    ;;
+  *"pr view"*headRefName*)
+    printf '%s\n' "feature/GH-99-test"
+    ;;
+  *"pr view"*headRepository*)
+    printf '%s\n' "$repo"
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$sb/bin/gh"
+}
+
+sb=$(make_sandbox)
+install_mock_gh_headrefoid_fails "$sb" '"projects/foo/docs/technical-design-x.md"'
+# The sandbox's local HEAD — the value the OLD fallback would have used.
+local_head=$(cd "$sb" && git rev-parse HEAD 2>/dev/null)
+# Marker written to MATCH that local HEAD: the setup most favourable to a
+# bypass, where every comparison passes under the old code.
+printf '%s\n' "$local_head" > "$(review_marker_path "o/r" 77 architecture "$sb")"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1091: forge HEAD unresolvable + marker matching LOCAL head -> BLOCKED" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "B) PR over the files API ceiling -> BLOCK (exit 2)"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"src/handlers/user.ts"' "$SHA"
+code=$(MOCK_LARGE=1 run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "blocks when changed-file count exceeds 3000" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "E) #1091/#1099 control: forge healthy, marker at forge HEAD -> still ALLOWED"
+# Guards against over-blocking: proves the fail-closed change didn't also
+# start blocking the ordinary healthy-forge path.
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
+printf '%s\n' "$SHA" > "$(review_marker_path "o/r" 77 architecture "$sb")"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1091 control: gh healthy, marker at forge HEAD -> still ALLOWED" "0" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "F) #1151 explicit wrapper repo outranks a leading cd target"
+sb=$(make_sandbox); pf=$(make_portfolio "me2resh/wrong-ops-repo")
+install_mock_gh_splitportfolio "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA" "$PF_SLUG"
+code=$(run_gate "$sb" "cd $pf && tracker_pr_merge \"$PF_SLUG\" \"77\" \"squash\" true")
+assert_eq "#1151 wrapper repo wins over cd-target and blocks" "2" "$code"
+rm -rf "$sb" "$pf"
+
+echo ""
+echo "F) #1151 unexpanded wrapper repo fails closed"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
+code=$(run_gate "$sb" 'tracker_pr_merge "$PR_HOST_REPO" "77" "squash" true')
+assert_eq "#1151 variable wrapper target blocks" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "F) #1151 unavailable diff fails closed"
+sb=$(make_sandbox)
+mkdir -p "$sb/bin"
+printf '%s\n' '#!/bin/bash' 'exit 1' > "$sb/bin/gh"
+chmod +x "$sb/bin/gh"
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "#1151 unresolvable diff blocks" "2" "$code"
+rm -rf "$sb"
+
+echo ""
+echo "G) missing required library blocks (me2resh/apexyard#1405 H2)"
+# me2resh/apexyard#1405 second-round review, Hakim H2: a missing required
+# library must BLOCK in DEFAULT bash, not just under POSIXLY_CORRECT — see
+# block-unreviewed-merge.sh's own copy of this test for the full
+# rationale. Runs an independent, self-contained copy of the hook (own
+# HOOK_DIR) so removing a library here cannot affect the real repo.
+# _lib-pr-repo.sh is included here (unlike its optional treatment in
+# block-unreviewed-merge.sh / block-merge-on-red-ci.sh) because this hook
+# has always sourced it unconditionally and now guards it the same way.
+for lib in _lib-extract-pr.sh _lib-review-markers.sh _lib-pr-repo.sh; do
+  for mode in default posix; do
+    sb=$(mktemp -d)
+    mkdir -p "$sb/.claude/hooks"
+    cp "$HOOK_SRC" "$sb/.claude/hooks/require-architecture-review.sh"
+    cp "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh" "$sb/.claude/hooks/_lib-extract-pr.sh"
+    cp "$(dirname "$SRC_ROOT/.claude/hooks/_lib-extract-pr.sh")/_lib-awk-fallback.sh" "$sb/.claude/hooks/_lib-awk-fallback.sh"
+    cp "$SRC_ROOT/.claude/hooks/_lib-review-markers.sh" "$sb/.claude/hooks/_lib-review-markers.sh"
+    cp "$SRC_ROOT/.claude/hooks/_lib-pr-repo.sh" "$sb/.claude/hooks/_lib-pr-repo.sh"
+    chmod +x "$sb/.claude/hooks/require-architecture-review.sh"
+    rm -f "$sb/.claude/hooks/$lib"
+    input=$(printf '{"tool_input":{"command":"%s"}}' "gh pr merge 500 --repo o/r --squash")
+    if [ "$mode" = "posix" ]; then
+      got_stderr=$(cd "$sb" && bash -c "echo '$input' | POSIXLY_CORRECT=1 bash .claude/hooks/require-architecture-review.sh" 2>&1 >/dev/null)
+    else
+      got_stderr=$(cd "$sb" && bash -c "echo '$input' | bash .claude/hooks/require-architecture-review.sh" 2>&1 >/dev/null)
+    fi
+    got_rc=$?
+    rm -rf "$sb"
+    label="missing-$lib-blocks-in-$mode-bash"
+    if [ "$got_rc" = "2" ] && echo "$got_stderr" | grep -qi "BLOCKED"; then
+      echo "PASS [$label]"; PASS=$((PASS+1))
+    else
+      echo "FAIL [$label]: want rc=2 + BLOCKED, got rc=$got_rc stderr=${got_stderr:0:300}" >&2
+      FAIL=$((FAIL+1))
+    fi
+  done
+done
+
+echo ""
+echo "H) design artifact + menu record at head -> ALLOW"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
+cat > "$(review_marker_path "o/r" 77 architecture "$sb")" <<EOF
+sha=${SHA}
+approved_by=user
+skill_version=3
+approval_channel=menu
+approved_at=2026-10-12T14:00:00Z
+approval_summary="Approve architecture review"
+EOF
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "architecture menu record at head allows" "0" "$code"
+for channel in 'approval_channel="menu"' "approval_channel='menu'"; do
+  marker=$(review_marker_path "o/r" 77 architecture "$sb")
+  sed "s/^approval_channel=.*/$channel/" "$marker" > "$sb/quoted-marker"
+  cp "$sb/quoted-marker" "$marker"
+  code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+  assert_eq "quoted channel rejects" "2" "$code"
+done
+rm -rf "$sb"
+
+echo ""
+echo "H) design artifact + menu record at another SHA -> BLOCK"
+sb=$(make_sandbox)
+install_mock_gh "$sb" '"projects/foo/docs/technical-design-x.md"' "$SHA"
+cat > "$(review_marker_path "o/r" 77 architecture "$sb")" <<EOF
+sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+approved_by=user
+skill_version=3
+approval_channel=menu
+approved_at=2026-10-12T14:00:00Z
+approval_summary="Approve architecture review"
+EOF
+code=$(run_gate "$sb" "gh pr merge 77 --repo o/r --squash")
+assert_eq "architecture menu record at other sha blocks" "2" "$code"
+rm -rf "$sb"
 
 echo ""
 echo "==================================="

@@ -50,15 +50,25 @@ on:
       - 'templates/audits/**'
   workflow_dispatch:
 
+# Least-privilege (#819 / Scorecard Token-Permissions #60): this job only
+# checks out the repo, runs a local script, and uploads a build artefact —
+# none of that needs contents:write (upload-artifact authenticates via its
+# own internal API, not the contents scope). `contents: write` was over-
+# granted; the job never pushes a commit, tag, or PR.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: extract-subpacks-on-release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   extract-subpacks:
     name: extract sub-packs + run smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # need full history so EXTRACTION_MANIFEST records a real SHA
 
@@ -92,7 +102,7 @@ jobs:
 
       - name: Upload extracted sub-packs as build artefacts
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: marketplace-subpacks
           path: marketplace/

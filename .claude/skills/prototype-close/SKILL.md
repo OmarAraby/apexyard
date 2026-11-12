@@ -5,6 +5,8 @@ argument-hint: "--promote | --discard [<prototype-ticket-number>]"
 allowed-tools: Bash, Read, Write
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /prototype-close — Close a Prototype via the Disposition Gate
 
 The disposition gate prevents the worst-of-both case: a prototype that "looked great in the demo" but never decides what to do with it, leaving a throwaway mockup that quietly gets promoted into production. Every prototype must close with one of two paths:
@@ -42,7 +44,7 @@ Defaults match today's single-fork layout. See `docs/multi-project.md`.
 Two paths:
 
 - If `$ARGUMENTS` includes a number (e.g. `--promote 142` or `--discard owner/repo#142`), use that.
-- Otherwise read the active-ticket marker (`.claude/session/current-ticket` or `.claude/session/tickets/<project>`) and use the ticket recorded there. If neither resolves, ask:
+- Otherwise read the active-ticket marker of the working tree you are in (see `/start-ticket` "Read the active ticket") and use the ticket recorded there. If no marker resolves, ask:
 
 ```
 Which prototype are you closing? Pass --promote <number> or --discard <number>,
@@ -126,28 +128,58 @@ What is NOT being carried over from the prototype artifact:
 {or "—"}
 ```
 
-After confirmation, create the issue:
+After confirmation, create the follow-up feature via the tracker abstraction
+(`tracker_create`, #670 / AgDR-0072, extended by the #709 creator sweep) so it
+lands in **this project's** tracker. For a GitHub adopter this runs
+`gh issue create` exactly as before.
 
 ```bash
-gh issue create --repo {owner/repo} \
-  --title "[Feature] {title}" \
-  --label "enhancement" \
-  --body "{body}"
+# Resolve the tracker lib (it lives in the ops fork's hooks dir) by walking up
+# from the cwd; source it.
+tracker_lib="$(r="$PWD"; while [ -n "$r" ] && [ "$r" != / ]; do \
+  [ -f "$r/.claude/hooks/_lib-tracker.sh" ] && { echo "$r/.claude/hooks/_lib-tracker.sh"; break; }; \
+  r="${r%/*}"; done)"
+# shellcheck source=/dev/null
+. "$tracker_lib"
+
+body_file="$(mktemp)"
+cat > "$body_file" <<'BODY'
+{body}
+BODY
+
+# tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
+result="$(tracker_create "{owner/repo}" "[Feature] {title}" "$body_file" "enhancement")"
+rc=$?
+rm -f "$body_file"
+if [ "$rc" -eq 3 ]; then
+  echo "Tracker is 'none' (shape-only) — nothing was created in a tracker." >&2
+  printf '%s\n' "$result"
+  exit 0
+elif [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+  echo "Follow-up creation failed — check the tracker CLI / auth. Nothing was created." >&2
+  exit 1
+fi
+
+ref="$(printf '%s' "$result" | jq -r '.ref')"   # the new feature's reference
+url="$(printf '%s' "$result" | jq -r '.url')"
 ```
 
-Capture the new issue number, then close the prototype with a cross-ref comment:
+Then close the prototype with a cross-ref comment. (Closing stays on `gh` here —
+issue *state transitions* are out of scope for the #709 creation sweep; a
+tracker-agnostic close/state primitive is separate follow-up work. On a
+non-GitHub project, close the prototype manually.)
 
 ```bash
 gh issue close {prototype-number} --repo {owner/repo} \
-  --comment "Prototype disposition: PROMOTE. Follow-up filed as #{new-number} — {feature-title}. Prototype artifact is NOT being lifted into production; the new feature work re-implements the chosen direction recorded above."
+  --comment "Prototype disposition: PROMOTE. Follow-up filed as #${ref} — {feature-title}. Prototype artifact is NOT being lifted into production; the new feature work re-implements the chosen direction recorded above."
 ```
 
 Return both URLs:
 
 ```
 Prototype closed: {owner/repo}#{prototype-number}
-Follow-up:        {owner/repo}#{new-number} — {feature-title}
-                  {url}
+Follow-up:        {owner/repo}#${ref} — {feature-title}
+                  ${url}
 ```
 
 #### 3b. DISCARD — one question, then write a memo

@@ -7,6 +7,8 @@ allowed-tools: Bash, Read, Grep, Glob, Write
 effort: medium
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /journey — User-Journey HTML with Modal-Per-Page Design Preview
 
 Generate a single self-contained HTML file at `projects/<name>/journeys/<feature-slug>.html` mapping the user journey as clickable boxes (each opening a modal with the page's content). Companion skill to `/c4` (architecture preview) and `/threat-model` (security preview) — closes the gap on **flow-level** preview before any implementation.

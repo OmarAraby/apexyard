@@ -2,10 +2,14 @@
 name: handover
 description: Onboard an external repo via a structured handover assessment + harnessability scoring across 5 codebase dimensions.
 argument-hint: "<project name> [path or url] [--topology <name>] [--all | --interactive]"
-allowed-tools: Bash, Read, Grep, Glob, Write
+allowed-tools: Bash, Read, Grep, Glob, Write, AskUserQuestion
 ---
 
 # /handover — External Repo Handover Assessment
+
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the
+handover assessment: write for the receiving human, lead with the outcome, and
+omit empty sections.
 
 Adopt an external repo into ApexYard management. The skill reads the target repo, synthesises a structured handover document, and tells you which ApexYard roles, workflows, and hooks should kick in.
 
@@ -97,12 +101,20 @@ The architecture stub is **written once** and never overwritten — it's a start
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 0. Mark this session as bootstrap (REQUIRED)
 
 `/handover` may run before any tracker tickets exist for the project being adopted, so the `require-active-ticket.sh` PreToolUse hook would block the registry / `projects/<name>/` writes the skill needs. Write a marker so the hook exempts this skill (it's on the default `bootstrap_skills` list in `.claude/project-config.defaults.json`):
 
 ```bash
-mkdir -p .claude/session && echo "handover" > .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+mkdir -p "$marker_home/.claude/session" && echo "handover" > "$skill_marker"
 ```
 
 Clear the marker on completion (Step "Post-Handover Checklist" below). If the skill is interrupted, the SessionStart hook `clear-bootstrap-marker.sh` clears it at the start of the next session. See AgDR-0011 + me2resh/apexyard#150.
@@ -113,7 +125,7 @@ The bootstrap exemption covers ONLY these writes:
 
 - `apexyard.projects.yaml` — registry append (step 7)
 - `projects/<name>/` — assessment, architecture stubs (container / context / sequence), README (steps 5, 6, 6.1)
-- `.claude/session/active-bootstrap` — the marker itself (step 0)
+- the path from `active_bootstrap_marker_path` — the marker itself (step 0)
 - Topology instantiation files (step 5.5, if a topology is picked)
 
 It does NOT cover:
@@ -167,33 +179,16 @@ CLONE_STATUS="cloned"   # or "preserved" | "declined" | "failed: <reason>"
 
 All subsequent reads in steps 2–6 use `$WORKSPACE_DIR/<name>/` as the repo root whenever `$CLONE_STATUS` is `cloned` or `preserved`. When `$CLONE_STATUS` is `declined` or `failed`, fall back to GitHub API reads via `gh api` / `gh -R <owner/name> …` (degraded but functional).
 
-### 1.5-reindex. Reindex the cloned repo in MCP (default: always attempt)
-
-After a successful clone (`$CLONE_STATUS=cloned`), trigger an MCP reindex so `search_code` and `search_docs` return results during the deep-dive phases that follow (steps 2–6). Without this step those queries return empty against the just-cloned repo, and the agent silently falls back to `find` + `cat` + `Bash` — defeating the token-cost benefit of cloning early.
-
-```
-mcp__apexyard-search__reindex(scope="project", project="<name>")
-```
-
-**On MCP unavailable:** the call will error. Catch the error, print a single-line warning, set the marker, and continue. **Do not skip silently** — silent skips are indistinguishable between "server down" and "agent forgot the step", and the second failure mode is what this step exists to prevent.
-
-```
-⚠ MCP reindex unavailable — falling back to grep + Read for steps 2–6
-```
-
-```bash
-REINDEX_STATUS="indexed"   # or "unavailable" | "skipped" (when $CLONE_STATUS != cloned)
-```
-
-When `$REINDEX_STATUS="indexed"`, prefer `search_code` and `search_docs` over `grep` + `Read` for the assessment reads in steps 2–6 (per the MCP-search-first rule). When `unavailable` or `skipped`, fall back to `grep` + `Read` without further apology.
-
-A `PostToolUse` hook (`suggest-mcp-reindex-after-clone.sh`) fires after the clone command and emits a one-line reminder of this step. Same advisory shape as `detect-role-trigger.sh` — exit 0, non-blocking, removes the "I forgot the rule applied here" failure mode.
+> **`bin/install-git-hooks.sh` is deliberately NOT invoked here.** An earlier version of this step called it against the freshly-cloned workspace, on the reasoning that it mirrors `/setup`'s call for the ops fork. It does not: `/setup` points `core.hooksPath` at the **ops fork's own** `.githooks/`, which ApexYard controls. Calling the same installer against an arbitrary, just-cloned third-party repo instead points git at *that repo's own* `.githooks/` (whatever it ships), and does so with no provenance check — the installer's only gate is "does a directory of that name exist." Git deliberately never clones `$GIT_DIR/hooks`, which is exactly what makes `git clone` of an untrusted repo a safe, read-only act; repointing `core.hooksPath` at a *tracked* directory removes that property, and a hostile `.githooks/post-checkout` or `.githooks/reference-transaction` then runs as the operator on the very next ordinary git operation — no push required. `/handover`'s whole point is to evaluate a repo before deeper commitment, so this is exactly the wrong moment to hand it code execution. Confirmed by security review on PR #1087 (HIGH-1).
+>
+> The gap this leaves — a managed-project clone's *own* `.githooks/` still isn't wired up by anything, so its terminal `git push` stays unprotected — is real and deliberately deferred, not silently dropped. The correct shape is for the framework to install **its own** hook into the clone's untracked `.git/hooks/` (never point at a tracked third-party directory), which needs its own design and its own ticket. Do not attempt it here.
 
 ### 1.5. Pick a topology (default: skip / custom)
 
 ApexYard ships **harness-template topologies** — bundles of curated handbooks + CI pipelines + AgDR templates per service shape. Picking one here pre-bakes the right governance surface for the stack; declining keeps the existing flow byte-for-byte. See [`topologies/README.md`](../../../topologies/README.md) and AgDR-0048.
 
-If the operator passed `--topology <name>` on the CLI, skip the interactive prompt and use that pick. Otherwise prompt:
+If the operator passed `--topology <name>` on the CLI, skip the interactive prompt and use that pick. Otherwise use `AskUserQuestion`.
+Recommend `Skip / custom` first. Give each topology a one-line effect. Use the prompt below only without the tool:
 
 ```
 Which topology fits this project?
@@ -220,6 +215,112 @@ Topology: typescript-nextjs v1.0.0 — will instantiate 11 files into projects/<
 ```
 
 If `$PICKED_TOPOLOGY=""`, print nothing — the rest of the flow is unchanged.
+
+### 1.6. Harness selection (skippable)
+
+Background. As of 2026-07-09 the framework's mechanical gates reach beyond Claude Code through thin per-harness adapters — see `docs/harnesses/README.md`, the single source of truth for the support matrix. A team adopting an existing repo may already be running (or want to run) a non-Claude-Code harness against it; this step surfaces the adapter path at handover time instead of leaving the adopter to discover `docs/harnesses/` on their own. Light and skippable — Claude Code adopters (the default) answer one question and move on.
+
+Use `AskUserQuestion` to select harnesses. Preserve multiple selections and split the six options across wizard questions.
+Recommend Claude Code first. Use the prompt below only without the tool:
+
+```
+Which harness(es) will drive work on {name}?
+  [1] Claude Code (default — the native, full experience)
+  [2] opencode
+  [3] pi (pi.dev)
+  [4] Codex
+  [5] Cursor
+  [6] Other / not sure
+
+[1-6, comma-separated for more than one — default 1]
+```
+
+**Branch on the answer:**
+
+- **1 / default / empty** → continue straight to step 2. No further output.
+- **6** → one line — *"No adapter for that harness yet. The mechanical gates (`.claude/hooks/*.sh`) are portable bash; see `docs/harnesses/README.md` § 'Adapter-authoring pattern for future harnesses' if you want to write one."* — then continue to step 2.
+- **2 / 3 / 4 / 5 (one or more)** → for each, print its install command + its one precondition, read fresh from `docs/harnesses/README.md` (single source of truth — don't duplicate the matrix here as a maintained copy). Snapshot below. Refresh from the doc before printing:
+
+  | Harness | Install | Precondition | Tier |
+  |---------|---------|---------------|------|
+  | opencode | `bash bin/install-opencode-adapter.sh` | run opencode headless with `--auto` | ✅ live-proven |
+  | pi | `bash bin/install-pi-adapter.sh` | run pi headless with `-a` / `--approve` | ✅ live-proven |
+  | Codex | `bash bin/sync-codex-adapter.sh` | grant hook-trust — `/hooks` interactively, `--dangerously-bypass-hook-trust` for a one-off headless run, or a user-level `~/.codex/hooks.json` | ✅ live-proven |
+  | Cursor | `bash bin/install-cursor-adapter.sh` | enable third-party configs; leftover full adapter must be replaced | ✅ native in the IDE (2026-09-16). CLI ignores hooks. Not in conformance CI |
+
+  **Honesty is load-bearing — never round a harness's tier up.** Print the current row from `docs/harnesses/README.md`. For Cursor, say native in the IDE, the `cursor-agent` CLI ignores hooks, a leftover full adapter can lock the session, and conformance CI has no headless path. Do not restore the retired failClosed-only claim. Link the per-harness page for the full workflow: `docs/harnesses/<harness>.md`.
+
+**Don't run the install command yourself** — print it, don't execute `bin/install-*-adapter.sh` against the target repo on the operator's behalf. Adapter install is a decision for the team taking ownership, not a side effect of adoption.
+
+Record the pick as `$SELECTED_HARNESSES` (comma-separated, or `claude-code` if 1/default) for the step 10 summary.
+
+### 1.7. Check server-side branch protection (advisory, default: always attempt)
+
+> Why this exists. AgDR-0115 records the decision that ApexYard does NOT install any client-side push protection into a managed-project clone — doing so would mean pointing `core.hooksPath` at that clone's own tracked `.githooks/`, which is precisely the HIGH-risk wiring #1087's security review removed (see the "1.5-clone" note above and `bin/install-git-hooks.sh`'s header). The accepted consequence: a human running `git push origin main` from a terminal inside this clone is not blocked by anything ApexYard installs — only agent-driven pushes stay covered, via the ops-fork's own `PreToolUse` hooks. For that residual, the managed repo's own **server-side branch protection** is the actual control, not a client-side backstop ApexYard ships. This step only checks whether that control is turned on and nudges the operator if it looks like it isn't — it is advisory, forge-agnostic, and fail-open: a missing check, a network failure, or an unsupported tracker kind never blocks the rest of `/handover`.
+
+Only run this check when the target repo's `<owner/name>` is known (a Git URL was given in step 1). A plain local path with no resolvable remote host has nothing to query: set `BRANCH_PROTECTION_STATUS="skipped (no remote host)"`, print nothing, and continue straight to step 2.
+
+Otherwise, resolve the default branch (prefer the local clone when available; fall back to the API) and the tracker kind, dispatching the protection check the same way `tracker_review_submit` / `tracker_pr_merge` already dispatch on `tracker_kind` (`.claude/hooks/_lib-tracker.sh`) rather than hardcoding one forge's CLI:
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-read-config.sh"
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-tracker.sh"
+
+kind=$(tracker_kind "<owner/name>")
+
+default_branch=""
+if [ "$CLONE_STATUS" = "cloned" ] || [ "$CLONE_STATUS" = "preserved" ]; then
+  default_branch=$(git -C "$WORKSPACE_DIR/<name>" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+fi
+if [ -z "$default_branch" ] && [ "$kind" = "gh" ]; then
+  default_branch=$(gh api "repos/<owner/name>" --jq .default_branch 2>/dev/null)
+fi
+
+BRANCH_PROTECTION_STATUS="skipped (default branch unknown)"
+if [ -n "$default_branch" ]; then
+  case "$kind" in
+    gh)
+      # gh api exits non-zero on BOTH "404 not protected" and a real
+      # failure (auth/network/no-permission/rate-limit). This check does
+      # not need to tell those apart — the response is the same either
+      # way: advise, never block. Fail-open by construction, not by
+      # accident.
+      if gh api "repos/<owner/name>/branches/${default_branch}/protection" >/dev/null 2>&1; then
+        BRANCH_PROTECTION_STATUS="protected"
+      else
+        BRANCH_PROTECTION_STATUS="not protected (or could not be verified)"
+      fi
+      ;;
+    glab)
+      encoded=$(printf '%s' "<owner/name>" | sed 's#/#%2F#')
+      if glab api "projects/${encoded}/protected_branches/${default_branch}" >/dev/null 2>&1; then
+        BRANCH_PROTECTION_STATUS="protected"
+      else
+        BRANCH_PROTECTION_STATUS="not protected (or could not be verified)"
+      fi
+      ;;
+    none|custom|*)
+      # No queryable, generically-shaped REST endpoint for these kinds —
+      # a `custom` tracker's PR/MR host is unknown, and `none` has no host
+      # at all. Say so plainly rather than guessing at an API shape.
+      BRANCH_PROTECTION_STATUS="skipped (no queryable forge for tracker.kind=${kind} — check your forge's branch protection settings manually)"
+      ;;
+  esac
+fi
+```
+
+If `$BRANCH_PROTECTION_STATUS` is `"not protected (or could not be verified)"`, print this nudge once (non-blocking — continue straight to step 2 regardless):
+
+```
+⚠ <name>'s default branch (<default_branch>) has no server-side branch
+protection turned on (or it couldn't be confirmed). ApexYard's own hooks
+only cover agent-driven pushes in this clone — a human running `git push`
+from a terminal here is not blocked. Server-side branch protection on the
+forge is the actual control for that gap (see AgDR-0115). Recommended:
+require a pull request before merging to <default_branch>.
+```
+
+If `$BRANCH_PROTECTION_STATUS` is `"protected"` or either `"skipped"` variant, print nothing further — the step 10 summary line is enough.
 
 ### 2. Read the surface area
 
@@ -514,10 +615,13 @@ If no risks match a row, omit that row. If fewer than 3 actions come out, add:
 ## Cleanup (REQUIRED before exit)
 
 ```bash
-rm -f .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-Always remove the bootstrap marker on a clean exit. If the skill is interrupted before this step, `clear-bootstrap-marker.sh` clears the stale marker on the next session.
+Always remove the bootstrap marker on a clean exit. If the skill is interrupted before this step, `clear-bootstrap-marker.sh` clears the marker when the same session restarts.
 
 ## Post-Handover Checklist
 
@@ -645,7 +749,9 @@ By this point the **computed core** is done: the handover assessment (step 5) an
 
 **Skip condition (`--all`)**: if the operator passed `--all` on the invocation, skip the checklist entirely. Generate the full default set (every row marked "default ✓" in the catalogue below) using each doc's conventional template. Note `document selection: --all (full set)` in the step 10 summary and continue to step 6. This is the byte-for-byte pre-checklist behaviour — existing scripted invocations keep working by adding `--all`.
 
-Otherwise (default, or explicit `--interactive`): present the checklist.
+Otherwise (default, or explicit `--interactive`): use `AskUserQuestion` for the document checklist.
+Split the nine documents into three wizard questions. Preserve the pre-ticked default and multiple selections.
+Use the checklist below only without the tool.
 
 #### Two kinds of output
 
@@ -668,10 +774,11 @@ Present this as a numbered checklist. The "default" column marks what `--all` (a
 | 6 | Architecture Vision draft (`architecture/vision.md`) | template-backed | `architecture/vision.md` | — | hand off to `/tech-vision <name>` |
 | 7 | Sequence diagram (`architecture/sequence-<flow>.md`) | template-backed | `architecture/sequence.md` | — | step 6.1 (sequence pass) |
 | 8 | In-repo `AGENTS.md` (written into the **target repo** via a PR) | computed (from the live assessment) | — | **— (default-OFF)** | step 8.5 (PR into the target repo) |
+| 9 | "Governed by ApexYard" README badge (written into the **target repo** via a PR) | computed (badge markdown, two variants) | — | **— (default-OFF)** | step 8.6 (PR into the target repo) |
 
 > The handover assessment + harnessability score are NOT in this catalogue — they are always written (step 5 / 4.5). The catalogue is only the *optional* surface.
 >
-> **Row 8 (`AGENTS.md`) is special**: it is the only catalogue row that writes into the **target repo** (everything else lands in the ops fork). It is **default-OFF** so the "read-only against the target repo" rule (Rule 1) stays true unless the operator consciously opts in. When selected, it is delivered via a branch + PR in step 8.5 — never a direct commit, never via the ops-fork bootstrap-exempt path. See AgDR-0073.
+> **Rows 8 and 9 are special**: they are the only catalogue rows that write into the **target repo** (everything else lands in the ops fork). Both are **default-OFF** so the "read-only against the target repo" rule (Rule 1) stays true unless the operator consciously opts in. When selected, each is delivered via a branch + PR — never a direct commit, never via the ops-fork bootstrap-exempt path. See AgDR-0073 (row 8) and AgDR-0090 (row 9).
 
 Render the prompt like this (pre-tick the default rows; the operator toggles):
 
@@ -687,10 +794,12 @@ always written. Pick which additional docs to generate (default-ticked shown wit
   [ ] 6. Architecture Vision draft     (template-backed → vision)
   [ ] 7. Sequence diagram              (template-backed → sequence)
   [ ] 8. In-repo AGENTS.md             (computed → PR into the TARGET repo)
+  [ ] 9. "Governed by ApexYard" badge  (computed → PR into the TARGET repo)
 
-Note: item 8 writes into the adopted repo itself (via a branch + PR) — the only
-item that does. It is default-OFF; tick it only if you want the repo to be
-self-describing to agents that work in it.
+Note: items 8 and 9 write into the adopted repo itself (via a branch + PR) — the
+only two that do. Both are default-OFF; tick 8 if you want the repo to be
+self-describing to agents, tick 9 if you want a visible badge crediting apexyard
+governance on the README.
 
 Reply with: 'default' (keep ticks as-is), 'all', 'none',
 a comma-list of numbers to GENERATE (e.g. '1,3,4'),
@@ -726,7 +835,8 @@ registry=$(portfolio_registry)
 custom_dir="$(dirname "$registry")/custom-templates"
 ```
 
-Present the candidates, defaulting to the conventional one:
+Use `AskUserQuestion` for each template pick. Recommend the conventional template first.
+Present the candidates below only when the harness lacks the tool:
 
 ```
 Template for the L2 container diagram:
@@ -958,6 +1068,31 @@ sequence_template="${SEQUENCE_TEMPLATE:-$(portfolio_resolve_template architectur
 
 Both follow the architecture-stub conventions: write once, never overwrite (preserve on re-handover), and prepend the machine-drafted note. The richer rows (3–6: DFD, Feature Inventory, journey, vision) are **not** generated here — they hand off to `/dfd`, `/extract-features`, `/journey`, `/tech-vision` per step 5.6's hand-off offer.
 
+### 6.2. Lint the generated architecture stubs
+
+Run `lint.sh` against every architecture stub that exists on disk after steps 6 and 6.1 — `container.md`, `context.md`, and any `sequence-<flow>.md`. This block is a fresh process (per the per-block preamble rule above), so re-source the portfolio helper and re-resolve `$projects_dir` rather than reusing a variable from an earlier block. Use `find` to list the files, not a glob — under zsh, an unmatched glob (the common case: no `sequence-*.md` stub exists) prints "no matches found" and aborts the loop with exit 1 before any file lints. The lint wraps the shared `_lib-mermaid-lint.sh` — it extracts every ` ```mermaid ` block from the file and validates each via `mmdc` (mermaid-cli), so broken syntax is caught at write time, not when a human opens the file on GitHub.
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-portfolio-paths.sh"
+projects_dir=$(portfolio_projects_dir)
+SKILL_DIR="$(git rev-parse --show-toplevel)/.claude/skills/handover"
+arch_dir="${projects_dir}/<name>/architecture"
+find "$arch_dir" -maxdepth 1 -type f \( -name "container.md" -o -name "context.md" -o -name "sequence-*.md" \) | while IFS= read -r stub; do
+  rc=0
+  "$SKILL_DIR/lint.sh" "$stub" || rc=$?
+  echo "lint: $stub exit=$rc"
+done
+```
+
+The loop resets `rc` to 0 before each file's lint call, so the per-file reporting rules below read the exit code for that file only, not a leftover from an earlier one.
+
+Handle each file's exit code before reporting it as written:
+
+- **Exit 0** — clean. Report the stub as `written (Mermaid lint: clean)`.
+- **Exit 1** — parse error. Print the lint output and either fix the offending block and re-lint, or leave the file as-is and note `written (Mermaid lint: FAILED — see output above)` in the summary. Never report a failed stub as plain `written`.
+- **Exit 3** — `mmdc` / Node unavailable. Print the warning `Mermaid not validated: mmdc not available.` and report the stub as `written (Mermaid not validated: mmdc not available)`. Do not report success.
+- **`--skip-lint`** (operator-requested) — report `written (Mermaid lint skipped)`.
+
 ### 7. Append to the portfolio registry
 
 **Don't just print the snippet** — offer to append it automatically:
@@ -1173,10 +1308,10 @@ The repo was cloned in step 1.5-clone (or was already local). Offer follow-up de
 
 **If `$CLONE_STATUS` is `cloned` or `preserved`:**
 
-Print a single follow-up offer after the step 10 summary:
+Print a single follow-up offer after the step 10 summary.
 
 ```
-✓ <name> is cloned at $WORKSPACE_DIR/<name>/ and indexed in MCP.
+✓ <name> is cloned at $WORKSPACE_DIR/<name>/.
   Want to run any of the following against the clone now?
 
   1. /threat-model <name>   — STRIDE threat model (recommended for first handover)
@@ -1349,6 +1484,7 @@ BODY
 
 Notes:
 
+- **Keep the branch name `docs/agents-md` exactly.** `validate-branch-name.sh` carries an exact-literal exemption for it (and for step 8.6's `docs/apexyard-badge`), because `/handover` runs before the adopted repo has a ticket to name — and that repo may have no tracker at all. Renaming it to anything else, `docs/agents-md-v2` included, re-arms the ticket-ID gate and blocks the push. See me2resh/apexyard#1161 and AgDR-0129.
 - **Specific-file staging only** — `git add AGENTS.md` (and `CLAUDE.md` only when newly created). Never `git add -A` / `git add .`.
 - **Branch + PR, never a direct commit to the default branch.** The repo owner reviews before merge — `/handover` does not merge the PR.
 - This PR lives in the **target repo's** tracker/SDLC, not the ops fork's. The ops-fork merge gates (Rex/CEO markers) don't apply — this is the target repo's own review.
@@ -1358,6 +1494,134 @@ Notes:
 
 ```bash
 AGENTS_MD_STATUS="PR opened: <url>"   # or "preserved" | "declined" | "not selected" | "skipped (no clone)" | "failed: <reason>"
+```
+
+### 8.6. Offer the "Governed by ApexYard" badge (only if row 9 was selected — default-OFF)
+
+Every repo apexyard governs is a potential backlink + a visible signal that the repo follows a real SDLC — but nothing in `/handover`'s output today surfaces that fact on the adopted repo itself. This step closes that gap the same way step 8.5 closes the "agent operating manual" gap: an opt-in, PR-delivered write into the **target repo**, never a direct commit. See AgDR-0090.
+
+#### Selection + preconditions
+
+- **Selection condition**: run this step only when row 9 (`"Governed by ApexYard" badge`) was selected in step 5.6. It is **default-OFF** — the operator must consciously tick it (or name it in the comma-list). If not selected, skip silently and note `Badge: not selected` in the summary.
+- **Clone precondition**: a local clone is required to branch + PR. If `$CLONE_STATUS` is `declined` or `failed`, skip with a one-line note: `Badge: skipped (no local clone — re-run with the repo cloned into workspace/<name>/)`. The repo root is `$WORKSPACE_DIR/<name>/` (resolve via `portfolio_workspace_dir`).
+- **Confirm before any target-repo write.** Editing a third-party repo's README is externally visible and easy to regret — ask explicitly, every run, default No:
+
+  ```
+  Add a "Governed by ApexYard" badge to <name>'s README?
+
+  This inserts one badge line near the top of the README, on a new branch,
+  and opens a PR for the repo owner to review. No direct commit.
+
+    [![Governed by ApexYard](https://img.shields.io/badge/governed_by-ApexYard-2F6DF6?style=flat-square)](https://github.com/me2resh/apexyard)
+
+  Add this badge to <name>'s README? [y/N — default N]
+  ```
+
+  Default **N**. On anything other than an explicit yes, skip and note `Badge: declined` in the summary.
+
+#### Pick the variant (governed_by vs built_with)
+
+On a yes, use `AskUserQuestion` to select the badge variant. Recommend `Governed by ApexYard` first.
+Use the prompt below only when the harness lacks the tool:
+
+```
+Which wording fits <name>?
+
+  [1] Governed by ApexYard   (adopted into apexyard's SDLC — the /handover case)
+  [2] Built with ApexYard    (built with apexyard from the start)
+
+[1/2 — default 1]
+```
+
+Record the pick as `$BADGE_VARIANT` (`governed_by` or `built_with`). The two canonical badge snippets — use these verbatim, never re-derive the URL by hand:
+
+```markdown
+[![Governed by ApexYard](https://img.shields.io/badge/governed_by-ApexYard-2F6DF6?style=flat-square)](https://github.com/me2resh/apexyard)
+```
+
+```markdown
+[![Built with ApexYard](https://img.shields.io/badge/built_with-ApexYard-2F6DF6?style=flat-square)](https://github.com/me2resh/apexyard)
+```
+
+Brand blue `#2F6DF6`, `flat-square` style — keep both fixed; don't invent a third variant or a different color/style on your own initiative.
+
+#### Idempotency check (never double-add)
+
+Before writing anything, scan the target repo's README for either badge already present:
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-read-config.sh"
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-portfolio-paths.sh"
+WORKSPACE_DIR=$(portfolio_workspace_dir)
+REPO="$WORKSPACE_DIR/<name>"
+
+README_FILE=$(ls "$REPO"/README.md "$REPO"/README.MD "$REPO"/Readme.md "$REPO"/README 2>/dev/null | head -1)
+
+if [ -z "$README_FILE" ]; then
+  BADGE_STATUS="skipped (no README found in target repo)"
+elif grep -qiE 'img\.shields\.io/badge/(governed_by|built_with)-apexyard' "$README_FILE"; then
+  BADGE_STATUS="skipped (badge already present in README)"
+fi
+```
+
+- **No README found** → skip; note `Badge: skipped (no README found)`. Don't create one just to hold a badge.
+- **Badge already present (either variant)** → skip; note `Badge: skipped (already present)`. Never add a second badge or swap the existing variant — a human who wants to change variants edits the README directly.
+- Otherwise, proceed to insertion.
+
+#### Insert near the top of the README (idempotent, one line)
+
+Insert the chosen badge markdown directly below the first top-level heading (`# Title`) in the README — the conventional badge position. If the README has no top-level heading, insert as the first line of the file.
+
+```bash
+cd "$REPO" || exit 1
+awk -v badge="$BADGE_MARKDOWN" '
+  NR==1 && /^# / { print; print ""; print badge; inserted=1; next }
+  { print }
+  END { if (!inserted) print badge }
+' "$README_FILE" > "$README_FILE.tmp" && mv "$README_FILE.tmp" "$README_FILE"
+```
+
+(`$BADGE_MARKDOWN` is the exact snippet for `$BADGE_VARIANT` chosen above, passed in verbatim — do not reconstruct it inline in the `awk` script.)
+
+#### Write, branch, and open the PR
+
+Mirrors step 8.5's delivery mechanics. If step 8.5 already opened (or is about to open) a PR on `docs/agents-md` in this same run, prefer adding the badge commit onto that same branch/PR instead of opening a second trivial PR — ask once: `Add the badge to the same AGENTS.md PR (branch docs/agents-md), or open a separate PR? [same/separate — default same]`. Otherwise (no AGENTS.md PR this run), open a dedicated branch:
+
+```bash
+cd "$REPO" || exit 1
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+DEFAULT_BRANCH=${DEFAULT_BRANCH:-main}
+git checkout -b docs/apexyard-badge "origin/$DEFAULT_BRANCH" 2>/dev/null || git checkout -b docs/apexyard-badge
+
+git add "$README_FILE"   # specific file, never -A / -.
+git commit -m "docs: add Governed-by-ApexYard badge to README"
+git push -u origin docs/apexyard-badge
+gh pr create --base "$DEFAULT_BRANCH" --head docs/apexyard-badge \
+  --title "docs: add Governed-by-ApexYard badge" \
+  --body-file <(cat <<'BODY'
+## Summary
+- Adds a "Governed by ApexYard" badge near the top of the README, linking back to `https://github.com/me2resh/apexyard` — a visible signal that this repo follows apexyard's SDLC (offered opt-in during `/handover`, not auto-applied).
+
+## Testing
+- Confirm the badge renders correctly and the wording (`Governed by` vs `Built with`) matches how this repo actually uses apexyard.
+
+_Generated by apexyard `/handover` — review & refine or close if you'd rather not carry the badge._
+BODY
+)
+```
+
+Notes:
+
+- **Keep the branch name `docs/apexyard-badge` exactly** — same exact-literal exemption in `validate-branch-name.sh` as step 8.5's `docs/agents-md`. A renamed branch re-arms the ticket-ID gate and blocks the push. See me2resh/apexyard#1161 and AgDR-0129.
+- **Specific-file staging only** — `git add "$README_FILE"`. Never `git add -A` / `git add .`.
+- **Branch + PR, never a direct commit to the default branch.** The repo owner reviews before merge — `/handover` does not merge the PR.
+- This PR lives in the **target repo's** tracker/SDLC, not the ops fork's. The ops-fork merge gates (Rex/CEO markers) don't apply.
+- On `gh pr create` failure (issues disabled, no push rights, etc.): report the error and the branch name, leave the local branch in place, and continue to step 9. Do not retry.
+
+#### Record for the summary
+
+```bash
+BADGE_STATUS="PR opened: <url> (<variant>)"   # or "preserved (already present)" | "declined" | "not selected" | "skipped (no clone)" | "skipped (no README)" | "failed: <reason>"
 ```
 
 ### 9. Offer validation (conditional, default-no)
@@ -1378,12 +1642,15 @@ If the project is healthy (recent commits, active PRs/issues), skip the prompt e
 ```
 Handover assessment written: projects/{name}/handover-assessment.md
 Document selection:          {"checklist — generated: {list}; deferred (handed off): {list}" | "--all (full set)" | "none (assessment only)"}
-Architecture stub:           projects/{name}/architecture/container.md ({written | preserved | skipped | skipped (deselected)})
+Architecture stub:           projects/{name}/architecture/container.md ({written (Mermaid lint: clean) | written (Mermaid not validated: mmdc not available) | written (Mermaid lint: FAILED — see output above) | preserved | skipped | skipped (deselected)})
 In-repo AGENTS.md:           {PR opened: <url> | preserved (already present) | declined | not selected | skipped (no clone) | failed: <reason>}
+Governed-by-ApexYard badge:  {PR opened: <url> (<variant>) | skipped (already present) | declined | not selected | skipped (no clone) | skipped (no README) | failed: <reason>}
 Topology bundle:             {"<name>@<version> instantiated (handbooks + AgDR draft + CI pipelines)" | "declined" | "skipped (no pick)" | "pipelines pending — workspace not cloned"}
 Registry updated:            apexyard.projects.yaml ({added | skipped})
 Next-step tickets filed:     {N filed of M offered | none offered (zero risks) | declined (skipped all) | skipped (registry not appended)}
 Workspace clone:             workspace/{name}/ ({cloned at step 1.5 | preserved (already existed) | declined (--no-clone) | failed: <reason> | n/a (local path given)})
+Harness:                     {"Claude Code (native)" | "<harness list> — install command(s) printed, see docs/harnesses/<harness>.md" | "other / not sure — no adapter yet"}
+Branch protection:           {"protected" | "not protected (or could not be verified) — nudge printed" | "skipped (default branch unknown)" | "skipped (no queryable forge for tracker.kind=<kind>)" | "skipped (no remote host)"}
 Validation:                  {"completed — verdict <GREEN|YELLOW|RED>" | "skipped" | "not offered (project is active)"}
 
 Tech stack: {one-liner}
@@ -1406,7 +1673,7 @@ Filed follow-up tickets:
 
 1. **Read-only against the target repo** — never modify the target repo without explicit permission. (The ops repo IS modified — you append to the registry and create the assessment file — but that's the point.)
 
-   **Exception (explicit, opt-in, PR-delivered): in-repo `AGENTS.md` generation.** Step 8.5 is the single sanctioned write into the target repo. It is **opt-in and default-OFF** (row 8 of the step 5.6 checklist), requires an explicit per-run confirmation, and is delivered via a **branch + PR** the repo owner reviews — never a direct commit to the default branch, and never via the ops-fork bootstrap-exempt write path. With the row left unticked (the default), this rule holds unchanged: `/handover` writes nothing into the target repo. See step 8.5, Rules 21–22, and AgDR-0073.
+   **Exceptions (explicit, opt-in, PR-delivered): in-repo `AGENTS.md` generation and the "Governed by ApexYard" README badge.** Steps 8.5 and 8.6 are the only two sanctioned writes into the target repo. Both are **opt-in and default-OFF** (rows 8 and 9 of the step 5.6 checklist), each requires an explicit per-run confirmation, and each is delivered via a **branch + PR** the repo owner reviews — never a direct commit to the default branch, and never via the ops-fork bootstrap-exempt write path. With both rows left unticked (the default), this rule holds unchanged: `/handover` writes nothing into the target repo. See step 8.5, step 8.6, Rules 21–23, AgDR-0073, and AgDR-0090.
 2. **Honest assessment** — if a build fails, say so. Don't paper over problems.
 3. **Always seed `projects/<name>/`** — even if minimal.
 4. **Auto-append to the registry** (with confirmation) — don't leave the user to copy-paste a snippet. Propose the append, validate the resulting YAML, roll back on failure.
@@ -1428,6 +1695,9 @@ Filed follow-up tickets:
 20. **Per-doc template pick defaults to the conventional template** — for each selected template-backed doc, list the resolved candidates (framework `templates/**` + adopter `custom-templates/**` via `portfolio_resolve_template`) and default to the conventional one (candidate `[1]`, i.e. the path `portfolio_resolve_template` would pick unprompted). Empty input takes the default, keeping `--all` and "default" runs byte-stable. Only list the adopter override candidate when it actually exists. Never reimplement a dedicated skill's artefact — DFD / Feature Inventory / journey / vision hand off to `/dfd` / `/extract-features` / `/journey` / `/tech-vision`.
 21. **`AGENTS.md` is opt-in, PR-delivered, and never overwrites** — the in-repo `AGENTS.md` (step 8.5) is the only artefact written into the target repo, and it is **default-OFF** so Rule 1 holds unless the operator opts in. It is delivered via a branch + PR (never a direct commit to the default branch; never via the ops-fork bootstrap-exempt path). An existing `AGENTS.md` or `CLAUDE.md` is **preserved, never overwritten** — exactly like the architecture stubs (Rule 11). `AGENTS.md` is canonical; a one-line `CLAUDE.md` importing it (`@AGENTS.md`) is offered only when no `CLAUDE.md` exists. The file carries a "generated by `/handover` on `<date>` — review & refine" note and stays focused on stable info (commands, layout, conventions). Refresh is manual (delete + re-run). See AgDR-0073.
 22. **`AGENTS.md` and `handover-assessment.md` don't duplicate — they split by reader** — `handover-assessment.md` (ops fork) is the **operator's** full analysis: risks, harnessability verdict, integration plan, next-step tickets. `AGENTS.md` (in the target repo) is the **agent's** concise operating manual: stable commands, layout, conventions, and the up-front gotchas an agent needs to start working. The volatile risk/integration analysis stays in the assessment; it is not copied into `AGENTS.md`. For low-harnessability repos, `AGENTS.md`'s Gotchas section surfaces what's fragile/missing (no strict types, no lint baseline, no coverage signal) — the in-repo echo of the assessment's LOW warning.
+23. **The "Governed by ApexYard" badge (step 8.6) is opt-in, PR-delivered, idempotent, and never a default** — row 9 of the step 5.6 checklist is **default-OFF** in every mode (checklist default, `--all`, and interactive `all`); it is only generated when explicitly ticked or comma-listed. Every run confirms with the operator by name (`Add a "Governed by ApexYard" badge to <name>'s README?`) before touching the target repo — there is no silent or bulk-implied consent for an externally-visible README edit. The badge is delivered via a branch + PR exactly like `AGENTS.md` (never a direct commit). It is **idempotent**: if either badge variant (`governed_by` or `built_with`) is already present in the README, the step skips and reports `already present` rather than adding a duplicate or swapping variants. The badge markdown itself (URL, color `#2F6DF6`, `flat-square` style) is fixed and quoted verbatim in step 8.6 — don't re-derive it. See AgDR-0090.
+24. **`docs/harnesses/README.md` is the single source of truth for harness support — step 1.6 summarises and links it, never duplicates the matrix.** Read the doc fresh when printing a harness's install command, precondition, or tier rather than trusting a stale table baked into this skill. Never round a harness's tier up. Do not restore the retired failClosed-only claim for Cursor. Step 1.6 is informational only: it prints the adapter install command but never runs it against the target repo.
+25. **The branch-protection check (step 1.7) is advisory and fail-open, never a gate.** It never blocks the rest of `/handover`, never retries, and never escalates a check failure into anything stronger than the one-line nudge. It exists because AgDR-0115 accepted that ApexYard installs no client-side push protection into a managed-project clone — the nudge is the only signal the operator gets that the *actual* control (the forge's own server-side branch protection) might be off. Dispatch on `tracker_kind` (`.claude/hooks/_lib-tracker.sh`), the same pattern `tracker_review_submit`/`tracker_pr_merge` use — never hardcode one forge's CLI or REST shape. `custom` and `none` tracker kinds get a generic manual-check note, not a guessed API call.
 
 ## When to use this
 

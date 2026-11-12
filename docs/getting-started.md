@@ -1,6 +1,7 @@
 # Getting Started with ApexYard
 
-Short version of the setup flow. For the full walkthrough (directory layout, daily workflow, upgrade path, FAQ) see [`multi-project.md`](multi-project.md).
+This page gives the short setup flow. See [`multi-project.md`](multi-project.md)
+for the directory layout, daily workflow, upgrade path, and FAQ.
 
 ---
 
@@ -8,17 +9,32 @@ Short version of the setup flow. For the full walkthrough (directory layout, dai
 
 - A GitHub account and an org you can fork into
 - [Claude Code](https://claude.com/claude-code) installed
-- [GitHub CLI (`gh`)](https://cli.github.com) installed (optional but recommended)
+- [GitHub CLI (`gh`)](https://cli.github.com) installed (recommended, but optional)
 - [`jq`](https://jqlang.org/download/) installed — required. Framework hooks use jq to read `.claude/project-config.json` overrides; without it your overrides silently no-op. `brew install jq` / `apt-get install jq` / `dnf install jq` depending on platform. `/setup` refuses to run without it, and a SessionStart banner surfaces the gap if jq disappears later. See [AgDR-0038](agdr/AgDR-0038-jq-as-hard-dependency.md) for the rationale.
+- **Windows**: Use [Git for Windows](https://gitforwindows.org) or WSL. The
+  `.claude/hooks/*.sh` files use Bash. Native `cmd.exe` and PowerShell cannot
+  run them. The `C:`-drive path issue reported in [#691](https://github.com/me2resh/apexyard/issues/691)
+  is fixed.
 - Basic familiarity with Claude Code's `CLAUDE.md` system
+
+After cloning, run `bash bin/apexyard doctor` before `/setup`, or use
+`apexyard doctor` if the CLI is on PATH. `/preflight` runs the same checks
+inside Claude Code. The report suggests fixes and makes no changes.
+Exit codes are 0 (pass), 1 (warning), and 2 (failure).
+
+On Windows, install the optional GitHub CLI with `winget install GitHub.cli`
+and the required jq 1.6 or later with `winget install jqlang.jq`. Run the
+check in Git Bash or WSL.
 
 ---
 
 ## Step 1: Fork apexyard on GitHub
 
-Your ops repo **is** a fork of apexyard. One repo, no nested installs.
+Your ops repo is a fork of ApexYard. It is one repository with no nested install.
 
-Visit [`github.com/me2resh/apexyard`](https://github.com/me2resh/apexyard), **Star** it, then **Fork** it into your org. Rename the fork if you want (`your-org/ops`, `your-org/apex`, or keep it as `apexyard` — GitHub handles the rename cleanly).
+Visit [`github.com/me2resh/apexyard`](https://github.com/me2resh/apexyard).
+Star it, then fork it into your organisation. Keep `apexyard`, or rename the
+fork to a name such as `your-org/ops`.
 
 Then clone your fork locally:
 
@@ -34,13 +50,18 @@ git clone https://github.com/your-org/apexyard.git
 cd apexyard
 ```
 
-Add the upstream remote so you can pull future updates:
+Add the upstream remote so you can pull updates later:
 
 ```bash
 git remote add upstream https://github.com/me2resh/apexyard.git
 ```
 
-Later, `git fetch upstream && git merge upstream/main` pulls the latest apexyard improvements into your fork.
+Later, fetch and merge from `upstream/main` to update your fork:
+
+```bash
+git fetch upstream
+git merge upstream/main
+```
 
 ---
 
@@ -134,29 +155,35 @@ I need to decide between PostgreSQL and DynamoDB for this service.
 Create an AgDR.
 ```
 
+### Turn on branch protection
+
+Turn on required review and required status checks on your protected branches. The hooks are guardrails, not a security boundary. See the [Threat model](../SECURITY.md#threat-model).
+
 ---
 
-## Optional: Terminal push hook (`core.hooksPath`)
+## Terminal push hook (`core.hooksPath`)
 
-The framework ships a `.githooks/pre-push` hook that runs the same check set as the Claude Code `pre-push-gate.sh` hook — markdownlint, shellcheck, and the subpack extraction smoke test — for terminal `git push` commands.
+The framework ships a `.githooks/pre-push` hook for `git push`. Once installed, it runs for a terminal push AND a Claude Code-driven push — git invokes it the same way either time. It runs two check sets in order. First, the framework's own hardcoded set (markdownlint, shellcheck, the subpack extraction smoke test), via `bin/run-pre-push-checks.sh`. Then this repo's own configured `.pre_push.commands`, via `bin/run-configured-pre-push-checks.sh`.
 
-The Claude Code hook (`pre-push-gate.sh`) only fires on pushes made _through Claude Code_. The git hook covers pushes made directly from the terminal.
+**Plain rule (AgDR-0173, AgDR-0115): ApexYard runs `.pre_push.commands` only inside an ApexYard fork that has this hook installed. A managed-project clone gets no local pre-push check from ApexYard, ever.** ApexYard never sets `core.hooksPath` in a managed clone (AgDR-0115) — that clone's own CI is its backstop.
 
-### One-time opt-in per clone
+Before AgDR-0173, the Claude Code hook (`pre-push-gate.sh`) ran a repository's `.pre_push.commands` itself, sometimes against the wrong repository (me2resh/apexyard#1366). It picked a target repository out of the Bash command's text. That could not be made sound. A heredoc, a quoted string, or a commit message could all look like a push without being one.
+
+After AgDR-0173, `pre-push-gate.sh` runs no repository's commands at all. It only reminds a session, on every matching push, to install the git hook above. It does this only when the session's own working-directory repo is itself an ApexYard fork. In a managed-project clone it prints at most a one-line note that ApexYard runs no checks there. It never suggests installing `core.hooksPath` in a repo that is not an ApexYard fork.
+
+### Installed automatically by `/setup`
+
+As of me2resh/apexyard#1086, `/setup` runs `bin/install-git-hooks.sh` for you, so a fresh ops-fork clone that's been through `/setup` already has `core.hooksPath` pointing at `.githooks`. A `check-git-hooks-installed.sh` SessionStart advisory also warns — same non-blocking shape as `check-upstream-drift.sh` — if a clone's `core.hooksPath` is unset, stale (points at a deleted directory), or a leftover pointer into a different clone's `.git/hooks`.
+
+If you skipped `/setup`, or want to run it by hand:
 
 ```bash
-git config core.hooksPath .githooks
+bash bin/install-git-hooks.sh
 ```
 
-Run this once inside your apexyard clone. Git then picks up `.githooks/pre-push` on every `git push` regardless of how you invoke it.
+Idempotent — safe to re-run. Repairs the stale-pointer cases above automatically; refuses to overwrite a `core.hooksPath` you set to something else on purpose unless you pass `--force`. See `bash bin/install-git-hooks.sh --help`.
 
-To enable it globally for all clones of apexyard (useful if you work across multiple machines or re-clone often):
-
-```bash
-git config --global core.hooksPath .githooks
-```
-
-Note: `--global` affects every git repo on your machine, not just apexyard. If other repos ship their own hooks under `.git/hooks/`, those will be shadowed. The safest approach is per-clone.
+`core.hooksPath` is per-clone git config (never committed), so this needs to run once per clone — that's exactly why `/setup` calls it for the ops fork rather than leaving it as a one-time manual step to remember. **`/handover` deliberately does NOT call it** against a freshly-cloned managed-project workspace: the installer's only gate is "does a `.githooks/` directory exist," with no provenance check, so pointing it at an arbitrary just-cloned third-party repo hands *that repo's own* committed hook scripts execution on the very next ordinary git operation — no push required (confirmed HIGH finding, PR #1087 security review). See the "1.5-clone" step in `.claude/skills/handover/SKILL.md` for the full rationale, and me2resh/apexyard#1088 for the open follow-up on giving a managed-project clone's own terminal pushes protection without this risk. `--global` also works (`git config --global core.hooksPath .githooks`) if you want every clone on a machine covered at once, but note it affects every git repo on that machine, not just apexyard — if other repos ship their own hooks under `.git/hooks/`, those get shadowed. Per-clone (what the installer does by default) is the safer default.
 
 ### Missing tools degrade gracefully
 
@@ -182,6 +209,20 @@ git commit --amend -m "$(git log -1 --format=%B)
 
 Link-check (lychee) is intentionally excluded — it is slow and network-dependent, making it unsuitable for pre-push latency.
 
+### Writing-profile check (advisory)
+
+`bin/run-pre-push-checks.sh` also runs `bin/check-writing-profile.sh` after the
+checks above (me2resh/apexyard#1418 item 6). It reports semicolons and
+sentences over 25 words in the Markdown lines a push adds, using the
+controlled technical writing profile in `.claude/rules/writing-standard.md`.
+
+This check is advisory only. It always exits 0. It never blocks a push, even
+when it finds faults or crashes. Run it by hand before opening a PR:
+
+```bash
+bash bin/check-writing-profile.sh
+```
+
 ---
 
 ## Managing model cost — why the main agent dominates spend
@@ -191,6 +232,22 @@ The per-agent model matrix ([AgDR-0050](agdr/AgDR-0050-agent-runtime-overhaul.md
 Three levers manage it, ordered by effort-to-win ratio: (1) **`opusplan`** — Opus plans, Sonnet executes (biggest win, no framework change); (2) the **thin-orchestrator pattern** — keep the Opus loop as a planner / coordinator and delegate implementation to spawned `sonnet` build agents via `/fan-out` or `Workflow`; (3) populate **`agent-routing.yaml`** to pin or route per-agent tiers.
 
 Full explanation + the opt-in thin-orchestrator mode: [`docs/orchestrator-cost-model.md`](orchestrator-cost-model.md).
+
+**Idle CI waits and the prompt cache.** The orchestrator waits for green CI with a Monitor before it spawns a reviewer. The main conversation is idle in that time. A subscription inside its usage limits keeps the main prompt cache for 1 hour. An API key, Bedrock, Vertex, or Foundry keeps it for 5 minutes. A CI wait longer than 5 minutes then rebuilds the whole main context. If you run outside the limits of a subscription, set `promptCacheTtl` to `"1h"` in your Claude Code settings where your provider supports it. The `CLAUDE_CODE_PROMPT_CACHE_TTL` environment variable does the same. Check that your provider accepts a 1-hour cache first. The rule text is in [`.claude/rules/pr-workflow.md`](../.claude/rules/pr-workflow.md).
+
+**Bounding the main context.** On a 1M-context Opus model, Claude Code compacts at about 967K tokens by default. A long orchestrator session then carries a very large context on every turn. The `autoCompactWindow` setting lowers the compaction point. The spike [GH-1637](spike-memos/GH-1637-compaction-threshold.md) shows that the setting bounds the context per turn. The maximum context stayed 30K to 43K tokens below the window. The setting is optional. Use it only when long sessions carry more context than you want and you accept more compactions. If you use it, set it in your user settings, not in a shared project file:
+
+```json
+{
+  "autoCompactWindow": 500000
+}
+```
+
+- **Recommended value:** `500000`. This value is an extrapolation from windows of 100K to 400K. Criterion ac2-2 of the token-efficiency plan must confirm it with `bin/token-cost.py`.
+- **Allowed values:** a whole number from `100000` to `1000000`. Claude Code caps it at the model window.
+- **Other ways to set it:** the `--autocompact` flag (Claude Code 2.1.221 or later) for one launch, `/autocompact` for one model (2.1.288 or later), and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in scripts. The variable accepts a plain integer only.
+- **Quality:** a lower window means more compactions, and each compaction can drop detail from a long task. The spike's quality test was weak, so check long tasks after you set a low window.
+- **Cost:** the spike found no cost saving. In two runs each, a window of 100K cost about 9 percent more than the default, because each compaction rebuilds the prompt cache. Do not go below 300K without a measurement.
 
 ---
 

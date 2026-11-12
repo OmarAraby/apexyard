@@ -7,6 +7,9 @@ allowed-tools: Bash, Read, Write
 
 # /walking-skeleton — Scaffold the Thin End-to-End Slice
 
+Read `.claude/rules/writing-standard.md`. Use the **controlled technical writing profile** for the
+walking-skeleton ticket and documentation. Remove empty sections.
+
 Creates a structured GitHub Issue for a **walking skeleton** — the thinnest possible end-to-end slice of a new feature or service: one trivial happy path wired through **every** architectural layer (UI → API → domain → store → deploy → back), with **no business logic beyond the thinnest happy path**. The skeleton actually runs and deploys, so integration and architecture are proven early. You then build the real product on top of it.
 
 > **The taxonomy — three skills, two axes (throwaway vs kept, technical vs UX).**
@@ -46,32 +49,29 @@ Defaults match today's single-fork layout (`./apexyard.projects.yaml`, `./projec
 Before any `gh issue create` (or other tracker CLI), write this skill's name to the active-issue-skill marker so `require-skill-for-issue-create.sh` lets the command through. At skill entry:
 
 ```bash
-# Resolve the ops-fork root the SAME way the hooks do (_lib-ops-root.sh):
-# anchor on the .apexyard-fork marker (split-portfolio v2 — onboarding.yaml
-# lives in the sibling portfolio repo, NOT the ops fork), falling back to the
-# onboarding.yaml + apexyard.projects.yaml pair (single-fork v1).
-ops_root="$PWD"; r="$PWD"
-while [ "$r" != / ]; do
-  if [ -f "$r/.apexyard-fork" ] || { [ -f "$r/onboarding.yaml" ] && [ -f "$r/apexyard.projects.yaml" ]; }; then
-    ops_root="$r"; break
-  fi
-  r=${r%/*}
-done
+# Ops root through the session pin (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) && [ -n "$ops_root" ] || { echo "No ops root. See docs/skills/shared/ops-root.md." >&2; exit 1; }
 mkdir -p "$ops_root/.claude/session"
-echo "walking-skeleton" > "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+echo "walking-skeleton" > "$skill_marker"
 ```
 
 Remove the marker on **every** exit path (success, early-exit, user cancel, error):
 
 ```bash
-rm -f "$ops_root/.claude/session/active-issue-skill"
+marker_home="$ops_root"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_issue_skill_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-The `clear-issue-skill-marker.sh` SessionStart hook sweeps stale markers from killed sessions, but a clean exit should never leave one behind. See AgDR-0030.
+The `clear-issue-skill-marker.sh` SessionStart hook clears only the current session's marker, but a clean exit should never leave one behind. See AgDR-0030.
 
 ### 1. Resolve the target repo
 
-Read `.claude/session/current-ticket` to determine which repo we're working in. If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
+Read the active-ticket marker of the working tree you are in to determine which repo we're working in. The marker is the `apexyard-ticket` file in the git dir of that tree. See `/start-ticket` "Read the active ticket". If no active ticket, check `apexyard.projects.yaml` for managed projects. If only one project, use it. If multiple, ask:
 
 ```
 Which project is this walking skeleton for?
@@ -243,26 +243,66 @@ Create this ticket? (yes / edit / cancel)
 - **edit** / **change X** → ask what to change, update, re-show
 - **cancel** / **no** → abort
 
-### 7. Create the GitHub Issue
+### 7. Create the issue (via the tracker abstraction)
+
+Dispatch creation through `tracker_create` (#670 / AgDR-0072, extended by
+the #709 creator sweep) so the skeleton lands in **this project's** tracker —
+GitHub, GitLab, or a `custom` CLI — per its `tracker:` block in
+`apexyard.projects.yaml`. For a GitHub adopter this runs `gh issue create`
+exactly as before.
 
 ```bash
-gh issue create --repo {owner/repo} \
-  --title "[Feature] Walking skeleton — {title}" \
-  --label "enhancement" \
-  --body "{formatted body}"
+# Resolve the tracker lib (it lives in the ops fork's hooks dir) by walking up
+# from the cwd; source it.
+tracker_lib="$(r="$PWD"; while [ -n "$r" ] && [ "$r" != / ]; do \
+  [ -f "$r/.claude/hooks/_lib-tracker.sh" ] && { echo "$r/.claude/hooks/_lib-tracker.sh"; break; }; \
+  r="${r%/*}"; done)"
+# shellcheck source=/dev/null
+. "$tracker_lib"
+
+# Pass the body via a file (arbitrary markdown — never inline-interpolated).
+body_file="$(mktemp)"
+cat > "$body_file" <<'BODY'
+{formatted body}
+BODY
+
+# tracker_create <owner/repo> <title> <body_file> [<labels_csv>] → {"ref","url"}.
+result="$(tracker_create "{owner/repo}" "[Feature] Walking skeleton — {title}" "$body_file" "enhancement")"
+rc=$?
+rm -f "$body_file"
+if [ "$rc" -eq 3 ]; then
+  echo "Tracker is 'none' (shape-only) — nothing was created in a tracker." >&2
+  echo "File this in your external system (e.g. Jira/Linear via MCP):" >&2
+  printf '%s\n' "$result"
+  exit 0
+elif [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+  echo "Walking-skeleton creation failed — check the tracker CLI / auth. Nothing was created." >&2
+  exit 1
+fi
+
+ref="$(printf '%s' "$result" | jq -r '.ref')"
+url="$(printf '%s' "$result" | jq -r '.url')"
 ```
 
-Note: a walking skeleton is filed under the normal feature label (`enhancement` by default) — **NOT** under `spike`. The label matters: there is **no** `walking-skeleton` exemption label, because the skeleton is held to the full SDLC. If your fork uses a different feature label, use that.
+Note: a walking skeleton is filed under the normal feature label (`enhancement`
+by default) — **NOT** under `spike`. The label matters: there is **no**
+`walking-skeleton` exemption label, because the skeleton is held to the full
+SDLC. If your fork uses a different feature label, pass that instead. (No
+`tracker_label_ensure` step here — `enhancement` is a default tracker label, so
+unlike the `spike` / `prototype` / `investigation` trigger labels it does not
+need to be created.)
 
 ### 8. Return the URL + branch suggestion
 
+Use the `ref` / `url` parsed from `tracker_create` in step 7:
+
 ```
-Created: {owner/repo}#{number} — Walking skeleton — {title}
-{url}
+Created: {owner/repo}#${ref} — Walking skeleton — {title}
+${url}
 
 When you start work:
-  /start-ticket {owner/repo}#{number}
-  git checkout -b feature/GH-{number}-{slug}-skeleton
+  /start-ticket {owner/repo}#${ref}
+  git checkout -b feature/GH-${ref}-{slug}-skeleton
 ```
 
 ### 9. Remind the operator this is KEPT — full SDLC

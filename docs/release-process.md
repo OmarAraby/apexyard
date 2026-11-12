@@ -1,8 +1,8 @@
 # apexyard release process
 
-apexyard uses a **release-cut** branch model (sometimes called gitflow-lite) for the framework repo. This doc is the prose runbook for cutting a release. The `/release` skill at `.claude/skills/release/SKILL.md` automates most of the steps; this doc is the manual fallback and the conceptual reference.
+ApexYard uses a **release-cut** branch model for the framework repository. This document explains the release steps and the checks behind them. The `/release` skill at `.claude/skills/release/SKILL.md` automates most of the work; this page is the manual fallback and the reference for how the process fits together.
 
-**Important — framework only.** This release model is for `me2resh/apexyard` itself, not for managed projects under apexyard governance. Managed projects stay trunk-based (PRs merge to `main`); only the framework has dev/main + tags. See `docs/multi-project.md` for the rationale.
+**Framework only.** This model applies to `me2resh/apexyard`, not to managed projects. Managed projects remain trunk-based and merge PRs to `main`; only the framework uses `dev`, `main`, and release tags. See `docs/multi-project.md` for the reason.
 
 Decision records: [`docs/agdr/AgDR-0007-release-cut-branch-model.md`](agdr/AgDR-0007-release-cut-branch-model.md) · [`docs/agdr/AgDR-0076-release-automation.md`](agdr/AgDR-0076-release-automation.md).
 
@@ -24,13 +24,15 @@ main ─────●────────────────●──
 
 ## When to cut a release
 
-Curated cadence — release when there's a meaningful batch on `dev` that's worth surfacing to adopters. Loose guidance:
+Use judgment. Cut a release when `dev` contains a meaningful batch that adopters should receive. These are guidelines:
 
 - **Patch (`vX.Y.Z+1`)** — bug fixes only. Cut whenever there are ≥ 1 fix and adopters would benefit.
 - **Minor (`vX.Y+1.0`)** — new features (additive). Cut every 1–2 weeks if there's been net-new feature work.
 - **Major (`vX+1.0.0`)** — breaking changes. Coordinate with adopters first; release notes call out migrations.
 
-If `dev` is N commits ahead and nothing's broken, you're free to NOT release — adopters will stay on the previous tag and the drift banner will tell them about the new tag when it's cut.
+Before cutting a release, run and review the cross-harness regression: `bin/quality-regression.sh --harness all` (see `docs/quality-regression/README.md`). A high-severity failure on any supported harness that ran stops the release until it is fixed. Record the result in `docs/quality-regression/runs/<date>/README.md`.
+
+If `dev` is ahead and nothing is broken, you can wait. Adopters stay on the previous tag, and the drift banner tells them about the new tag after release.
 
 ## Cutting a release — happy path (automated)
 
@@ -46,12 +48,13 @@ The skill:
 
 1. Pre-flights the repo (clean tree, dev branch, non-empty delta)
 2. Auto-detects the semver bump from conventional commits (or accepts explicit version)
-3. Calls `bin/release-changelog.sh` to generate the CHANGELOG section (independently testable helper)
-4. Shows the draft for review / editing
-5. Writes `CHANGELOG.md` (prepends the new section)
-6. Creates the release branch `release/vX.Y.Z` from dev, commits, and pushes
-7. Opens the release PR (dev→main) with the CHANGELOG section as body
-8. Stops at PR creation — CEO approval gate remains the sole human gate
+3. Calls `bin/release-changelog.sh` to generate the CHANGELOG section (independently testable helper). A `Closes #N` line appears only when the real PR body (fetched via `gh pr view`) closes `#N`; on a fetch failure the script falls back to a scoped-title close and warns (AgDR-0197 / #1490)
+4. Lists every line the release tip removes from `main` via `bin/release-list-removed-lines.sh`, and asks before continuing when the list is non-empty (#1490)
+5. Shows the draft for review / editing
+6. Writes `CHANGELOG.md` (prepends the new section)
+7. Creates the release branch `release/vX.Y.Z` from dev, commits, and pushes
+8. Opens the release PR (dev→main) with the CHANGELOG section as body
+9. Stops at PR creation — CEO approval gate remains the sole human gate
 
 After the PR merges, the `auto-tag-on-release-pr-merge.yml` CI workflow fires and:
 
@@ -59,7 +62,7 @@ After the PR merges, the `auto-tag-on-release-pr-merge.yml` CI workflow fires an
 - Runs the ancestry guard (`git merge-base --is-ancestor <sha> main`)
 - Creates a GitHub Release entry from the CHANGELOG section in the PR body (in the same job — a tag pushed via GITHUB_TOKEN does not trigger a secondary release workflow)
 
-Then run `/release-sync vX.Y.Z` to sync main→dev and prevent squash-divergence accumulation.
+Then run `/release-sync vX.Y.Z` to sync main→dev and prevent squash-divergence accumulation. The skill merges main into dev with a plain merge, not a blind `-X ours`. It stops and asks on every conflict, including one caused only by the release squash commit — see `.claude/skills/release-sync/SKILL.md` § "Merge main with a plain merge" and AgDR-0170.
 
 ## Cutting a release — manual steps (fallback)
 
@@ -76,22 +79,60 @@ PREV_TAG=$(git describe --tags --abbrev=0 upstream/main)
 # e.g. PREV_TAG=v3.2.0, so next is v3.3.0 (minor bump because of feat: commits)
 VERSION=v3.3.0
 
-# 3. Generate the CHANGELOG section
+# 3. Generate the CHANGELOG section — capture stderr too: it carries the
+#    exact commit range the script used (trailer-anchored, or the #737
+#    sync-boundary fallback). The count-mismatch guard below needs it (#1002)
+#    — DO NOT substitute `git rev-list --count upstream/main..upstream/dev`;
+#    under the release-cut squash model that range only ever grows and always
+#    false-positives the guard (v5.2.0 cut: 402 raw commits vs. ~1 real entry).
 PREV_TAG="$PREV_TAG" HEAD_REF="upstream/dev" VERSION="$VERSION" DATE="$(date +%F)" \
-  bash bin/release-changelog.sh > /tmp/changelog-section.md
+  bash bin/release-changelog.sh > /tmp/changelog-section.md 2>/tmp/release-changelog-range.txt
+LOG_RANGE=$(grep -oE 'RELEASE_CHANGELOG_RANGE=.*' /tmp/release-changelog-range.txt | cut -d= -f2-)
 # Review and edit /tmp/changelog-section.md
+
+# #1017: fail CLOSED on a missing/unparseable range instead of letting an
+# empty $LOG_RANGE silently flow into `git rev-list --count ""` below (its
+# stderr never reaches $RAW_COUNT, so the guard would otherwise read a
+# "0 commits" pass — AgDR-0104: a gate that can't evaluate its precondition
+# must block, not allow).
+if [ -z "$LOG_RANGE" ]; then
+  echo "ERROR: RELEASE_CHANGELOG_RANGE missing from /tmp/release-changelog-range.txt — the count-mismatch guard has nothing to check. Do not proceed." >&2
+  exit 1
+fi
+RAW_COUNT=$(git rev-list --count "$LOG_RANGE") || {
+  echo "ERROR: 'git rev-list --count $LOG_RANGE' failed — cannot evaluate the count-mismatch guard. Do not proceed." >&2
+  exit 1
+}
+ENTRY_COUNT=$(grep -E '^- ' /tmp/changelog-section.md | grep -vcE '^- Closes ' || true)
+[ -n "$ENTRY_COUNT" ] || ENTRY_COUNT=0
+GAP=$(( RAW_COUNT - ENTRY_COUNT ))
+if [ "$GAP" -gt 5 ]; then
+  # #1017: RAW_COUNT and ENTRY_COUNT both derive from $LOG_RANGE now, so this
+  # gap means commits genuinely inside the range aren't classifying into
+  # changelog entries — not a truncated range (that failure mode is closed at
+  # the trailer-anchoring source; see AgDR-0094 and step 7b below).
+  echo "WARNING: $LOG_RANGE has $RAW_COUNT commits but the changelog lists only $ENTRY_COUNT entries (some commits inside the range didn't classify into an entry)." >&2
+fi
 
 # 4. Prepend to CHANGELOG.md
 cat /tmp/changelog-section.md CHANGELOG.md > /tmp/cl_new.md
 mv /tmp/cl_new.md CHANGELOG.md
 
-# 5. Cut release branch from dev
+# 5. Cut release branch from dev — the Released-From trailer goes in THIS
+#    commit message, as its own final paragraph. It is the sole commit on
+#    the branch, so it is what a squash merge carries forward (see step 7).
+DEV_SHA=$(git rev-parse upstream/dev)
 git checkout -b "release/$VERSION" upstream/dev
 git add CHANGELOG.md
-git commit -m "chore: release $VERSION"
+git commit -m "chore: release $VERSION
+
+Refs #<release-ticket>
+
+Released-From: $DEV_SHA"
 git push upstream "release/$VERSION"
 
-# 6. Open release PR
+# 6. Open release PR — the PR body ALSO carries the trailer as its own final
+#    line (human visibility on the PR page), matching the commit above.
 gh pr create \
   --repo me2resh/apexyard \
   --base main \
@@ -103,7 +144,20 @@ gh pr create \
 # 7. Run normal review flow on the PR
 #    - /code-review
 #    - /approve-merge <pr>
-#    - gh pr merge <pr> --squash
+#    - Merge with an EXPLICIT subject + body — never a bare `gh pr merge
+#      --squash` (#1004). This repo has squash_merge_commit_message=
+#      COMMIT_MESSAGES, which builds the squash body from the branch's own
+#      commits, not the PR body — so relying on the PR body alone silently
+#      drops the trailer. Passing --body-file guarantees the merged commit
+#      matches exactly what was reviewed, independent of that repo setting:
+gh pr merge <pr> --repo me2resh/apexyard --squash \
+  --subject "release(#<ticket>): $VERSION" \
+  --body-file /tmp/release-pr-body.md
+
+# 7b. Verify the trailer landed — do not skip, do not proceed to step 9 if empty:
+git fetch upstream main
+TRAILER=$(git log -1 --pretty=format:'%(trailers:key=Released-From,valueonly)' upstream/main)
+[ -n "$TRAILER" ] || { echo "ERROR: Released-From trailer missing on main." >&2; exit 1; }
 
 # 8. After merge: CI auto-tags (auto-tag-on-release-pr-merge.yml)
 #    If CI fails, tag manually:
@@ -118,6 +172,15 @@ git push upstream --tags
 # 9. Run release-sync
 # /release-sync $VERSION
 ```
+
+## After the release
+
+Do these steps after `/release-sync` merges. They are advisory. No hook enforces them.
+
+1. Update the README contributor credits for new PR authors and new issue authors since the previous release.
+2. Comment on each closed issue that an outside reporter opened. Name the version, link the release, and thank the reporter.
+3. Add a "Thanks" section to the GitHub release notes. Name the same reporters.
+4. Update the website through the site's own sync process (`me2resh/apexyard-site`, plan `plan-release-sync`).
 
 ## Release PR caveats
 
@@ -137,7 +200,7 @@ The `.github/workflows/auto-tag-on-release-pr-merge.yml` workflow fires when any
 - Uses `github.sha` (the squash commit SHA) — always the correct commit, never the release-branch HEAD (which was discarded by the squash)
 - Runs `git merge-base --is-ancestor <sha> main` before tagging
 - Tags and pushes with `git push origin --tags` (not the bare tag name — avoids the branch-name validator hook misfiring)
-- Creates a GitHub Release entry in the same job (a tag pushed via GITHUB_TOKEN does not trigger a secondary release workflow — confirmed in apexyard-premium#326)
+- Creates a GitHub Release entry in the same job (a tag pushed via GITHUB_TOKEN does not trigger a secondary release workflow — confirmed in a private downstream project)
 
 This closes the v2.3.0 incident where the tag was placed on the release-branch HEAD rather than the squash commit.
 
@@ -153,6 +216,7 @@ PREV_TAG=v3.2.0 HEAD_REF=upstream/dev VERSION=v3.3.0 DATE=$(date +%F) \
 ```
 
 Input: `PREV_TAG`, `HEAD_REF`, `VERSION`, `DATE` env vars.
+Optional: `RELEASE_GH` (default `gh`), `REPO_REMOTE`, `PR_LOOKUP_REPO`, `PR_LOOKUP_TIMEOUT` (default 10) for the PR-body close check (AgDR-0197 / AgDR-0208).
 Output: markdown CHANGELOG section to stdout.
 Never writes files; callers decide where to write the output.
 Tests: `.claude/hooks/tests/test_release_changelog.sh`.
@@ -182,6 +246,7 @@ For maintainers of `me2resh/apexyard`, configure GitHub branch protection on `ma
 
 - Require pull request before merging
 - Require approvals: 1
+- Dismiss stale approvals when new commits are pushed
 - Require status checks to pass before merging (markdownlint, lychee, shellcheck, Verify Ticket ID)
 - Restrict who can push to matching branches (only repo admins, for the rare manual tag-fix case)
 
@@ -191,8 +256,11 @@ Branch protection on `dev` matches the prior `main` setup — required reviews +
 
 - `AgDR-0007` — the original release-cut branch model decision record
 - `AgDR-0076` — the release-automation design record
+- `AgDR-0170` — the decision to replace `-X ours` with a plain merge that stops and asks on every conflict in `/release-sync`, and to add a behind-base check to `/approve-merge`
+- `AgDR-0197` — close changelog issues only from the PR body via `gh pr view` (scoped-title fallback + warning on fetch failure), and list lines a release removes from main (#1490)
 - `.claude/skills/release/SKILL.md` — the automated flow (this doc is the manual fallback)
 - `bin/release-changelog.sh` — the changelog generation helper
+- `bin/release-list-removed-lines.sh` — lists lines the release tip deletes from main
 - `.github/workflows/auto-tag-on-release-pr-merge.yml` — the auto-tag CI workflow
 - `golden-paths/pipelines/auto-tag-on-release-pr-merge.yml` — the reusable golden-path copy
 - `.claude/skills/update/SKILL.md` — the inverse skill, for adopters pulling new releases

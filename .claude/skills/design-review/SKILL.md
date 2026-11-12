@@ -1,12 +1,20 @@
 ---
 name: design-review
 description: Review a technical design / migration AgDR / feature spec for architectural soundness BEFORE the Build phase. Invokes the Solution Architect agent (Tariq) — the non-code analog of /code-review.
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: "<pr-number-or-path> [repo]"
 allowed-tools: Bash, Read, Grep, Glob
 ---
 
 # /design-review — Solution Architecture Review
+
+Read .claude/rules/writing-standard.md before you write a review.
+Use the controlled technical writing profile for the architecture review.
+Treat a profile fault in the design artifact as advisory, with the failed
+rule named and a clear replacement shown. Request changes only when the
+fault changes meaning or drops evidence — that fault is a correctness
+finding, not a style nit.
+State the verdict and next action first. State evidence after the verdict.
 
 Review a **design artifact** — a technical design doc, a migration AgDR, or a feature spec / PRD — for architectural soundness before any code is built against it. This is the non-code analog of `/code-review`: where Rex reviews a code PR, **Tariq (the Solution Architect)** reviews the design.
 
@@ -30,14 +38,72 @@ See [`.claude/rules/role-triggers.md`](../../rules/role-triggers.md) for the ful
 /design-review docs/designs/checkout.md   # doc-only review (no PR yet)
 ```
 
+## Running tests in a scratch clone
+
+Tariq may need to run tests or attack probes against the PR head, outside this repository's working tree. Use a plain `git clone` into a literal scratch path. Or export with `git archive <ref> | tar -x -C <scratchpad>` into this session's scratchpad. A sanctioned review needs no ticket for that write. The agent file states the path rule. If a hook blocks a command, stop that step. Report the exact command, the hook, and its message to the orchestrator. Never rephrase, split, encode, or disguise a command to get past a hook. Full pattern: `.claude/agents/solution-architect.md` § "Running tests in a scratch clone".
+
+The reviewer mutation lock blocks `git clone`, `git fetch`, and `git checkout` while the active-reviewer marker exists. Prepare the scratch clone and fetch the PR head before step 0 arms the marker.
+
 ## Process
 
-1. Resolve the target — a PR number (preferred: gives a diff + a place to post the verdict + a marker key) or a path to a design artifact. **Also resolve the repo**: the optional second arg (`/design-review 42 owner/repo`), or the `owner/repo#N` form. In split-portfolio v2 the PR lives in a sibling repo, so a bare `gh pr view 42` resolved against the ops-fork cwd hits the WRONG repo — pass the resolved repo as `--repo` to **every** `gh pr view` / `gh pr diff` / `gh pr review` call, and thread it into Tariq's spawn so his `<owner>__<repo>__<pr>-architecture.approved` marker is keyed on the PR's real repo. This is the slug the `require-architecture-review.sh` gate derives from the merge command's cd-target (me2resh/apexyard#687). If only a bare number is given and `gh pr view <N>` can't resolve the PR from the current cwd, STOP and ask for the `owner/repo#N` form — never write the marker under a guessed qualifier.
+### 0. Write the active-reviewer marker (REQUIRED — me2resh/apexyard#843, when reviewing a PR)
+
+Before spawning the Solution Architect agent (Tariq) for a PR review, write the active-reviewer session marker. It records that this review pass is the sanctioned one and suppresses `warn-review-marker-write.sh`'s advisory warning on the `*-architecture.approved` write (same convention as `/code-review`'s rex marker; that hook warns and never blocks since #1026 — AgDR-0111). The marker is scoped to THIS Claude Code session (me2resh/apexyard#1376) — resolve its path through `active_reviewer_marker_path`, never write the bare `.claude/session/active-reviewer` path directly. Use the SAME resolved `owner/repo` from step 1 (below) — the sibling-repo resolution in split-portfolio v2 matters here too. At skill entry:
+
+```bash
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
+. "$ops_root/.claude/hooks/_lib-review-markers.sh"
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "architecture")
+mkdir -p "$(dirname "$active_marker")"
+printf '%s\n' "<owner/repo>#<pr>:architecture" > "$active_marker"
+```
+
+On skill exit (after the review is posted, whether or not the marker gets written), clear it. Shell variables do not persist across separate Bash tool calls, so the exit step re-resolves `ops_root` and `active_marker` from scratch — it does not reuse the step-0 variable, which would silently be empty in a later call and turn the `rm -f` into a no-op:
+
+```bash
+# Ops root: pin first, then walk up (docs/skills/shared/ops-root.md).
+ops_root=$(p="${APEXYARD_OPS_PIN_DIR:-$HOME/.claude/apexyard}/ops-root-${CLAUDE_CODE_SESSION_ID:-}"; r=""; [ -z "${APEXYARD_OPS_DISABLE_PIN:-}" ] && [ -f "$p" ] && IFS= read -r r < "$p"; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] || { r="$PWD"; while [ -n "$r" ] && [ ! -f "$r/.claude/hooks/_lib-ops-root.sh" ]; do r=${r%/*}; done; }; [ -f "$r/.claude/hooks/_lib-ops-root.sh" ] && . "$r/.claude/hooks/_lib-ops-root.sh" && resolve_ops_root) || ops_root=$(git rev-parse --show-toplevel)
+. "$ops_root/.claude/hooks/_lib-review-markers.sh"
+active_marker=$(active_reviewer_marker_path "$ops_root" "" "<owner/repo>" "<pr>" "architecture")
+rm -f "$active_marker"
+```
+
+The marker is keyed on session, repo, PR and review kind (me2resh/apexyard#1649). Each review writes and clears only its own file, so reviews run at the same time. The mutation lock applies to review agents only; the orchestrator and build agents can keep working. Use the same `<owner/repo>`, `<pr>` and kind in the write step and the exit step. Spawn the reviewer with the Agent tool and `subagent_type: solution-architect`. Never use `general-purpose`: the lock finds a review agent by that type.
+
+Doc-only reviews (no PR yet) never write a marker, so this step is a no-op for them. Nothing mechanically stops a build-class sub-agent writing the same file; what makes this marker legitimate is that a real, independent review happened. See `.claude/hooks/warn-review-marker-write.sh` and `.claude/rules/pr-workflow.md` § "Build agents cannot self-review".
+
+### 0a. Never hand the reviewer a marker path (me2resh/apexyard#1144)
+
+**The spawn prompt for Tariq MUST NOT contain a literal marker path.** Say
+*"write your approval marker on an APPROVED verdict"*; say nothing about where.
+
+Tariq already resolves the correct path through `review_marker_path` — the
+repo-qualified `<owner>__<repo>__<pr>-architecture.approved` form from AgDR-0060,
+which is the exact path the gates read. A path in the prompt overrides that
+correct resolution: the agent obeys the instruction it was handed, and the
+marker lands at the bare-number `<pr>-architecture.approved` instead. **No gate reads
+that path** — there is no bare-number fallback on any on-disk marker lookup.
+
+The failure is silent in the dangerous direction. `ls .claude/session/reviews/`
+shows a file that reads, to a human, like a valid approval; only the merge
+attempt reveals otherwise. And at that moment the obvious repair — moving the
+file into place — is marker forging, the behaviour
+[`pr-workflow.md`](../../rules/pr-workflow.md) § "Build agents cannot
+self-review" exists to prevent. The right recovery is always: delete the
+gate-invisible file and re-run a real review.
+
+`warn-unqualified-review-marker.sh` warns (advisory, never blocks) when a
+bare-number marker appears, and the merge gates name the near-miss in their
+refusal message — but the cheap fix is upstream of both: don't pass a path.
+
+1. Resolve the target — a PR number (preferred: gives a diff + a place to post the verdict + a marker key) or a path to a design artifact. **Also resolve the repo**: the optional second arg (`/design-review 42 owner/repo`), or the `owner/repo#N` form. In split-portfolio v2 the PR lives in a sibling repo, so a bare `gh pr view 42` resolved against the ops-fork cwd hits the WRONG repo — pass the resolved repo as `--repo` to **every** `gh pr view` / `gh pr diff` call, and thread it into Tariq's spawn so it becomes BOTH his `$PR_HOST_REPO` (the base repo `tracker_review_submit` posts the review to — #763) AND the key for his `<owner>__<repo>__<pr>-architecture.approved` marker (and the active-reviewer marker from step 0). This is the slug the `require-architecture-review.sh` gate derives from the merge command's cd-target (me2resh/apexyard#687). If only a bare number is given and `gh pr view <N>` can't resolve the PR from the current cwd, STOP and ask for the `owner/repo#N` form — never write the marker under a guessed qualifier.
 2. Fetch PR details and the latest commit SHA (when reviewing a PR).
 3. Read the design artifact(s).
 4. Review against the architecture review lens (below) plus discovered handbooks.
-5. Submit a GitHub review via `gh pr review` (when reviewing a PR).
-6. On APPROVED only: write the sign-off marker so the Design→Build gate passes (see `/approve-architecture` — Tariq writes the marker himself on an APPROVED verdict; `/approve-architecture` is the human/operator path to record the same marker).
+5. Submit the review through the tracker-agnostic `tracker_review_submit` (gh PR / glab MR / custom host — #763), not a hardcoded `gh pr review` (when reviewing a PR).
+6. On APPROVED only: write the sign-off marker so the Design→Build gate passes (see `/approve-architecture` — Tariq writes the marker himself on an APPROVED verdict; `/approve-architecture` is the human/operator path to record the same marker). Clear the active-reviewer marker from step 0 after the review is posted.
+
 
 ## Review Lens
 

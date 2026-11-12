@@ -6,6 +6,8 @@ argument-hint: "[project-path]"
 effort: high
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /compliance-check — GDPR + ePrivacy Compliance
 
 Deep-dive regulatory compliance analysis. Checks cookie consent, privacy policy, terms of service, data handling, and user rights. Invoke when `/launch-check`'s compliance row shows WARN or FAIL, or proactively before launching in the EU/UK.

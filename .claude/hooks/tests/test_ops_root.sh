@@ -24,6 +24,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 LIB="$SRC_ROOT/.claude/hooks/_lib-ops-root.sh"
 
@@ -224,8 +229,75 @@ case_8() {
   )
 }
 
+# ---------------------------------------------------------------------------
+# Case 9: the fork is one level below an unrelated enclosing git repository
+# ---------------------------------------------------------------------------
+case_9() {
+  local case_name="resolve_ops_root from enclosing git repo → nested fork"
+  local outer sb
+  outer=$(mktemp -d)
+  sb="$outer/apexyard-fork"
+  git init -q "$outer"
+  build_sandbox "$sb"
+  local expected
+  expected=$(cd "$sb" && pwd -P)
+  (
+    # shellcheck source=/dev/null
+    . "$LIB"
+    out=$(cd "$outer" && resolve_ops_root)
+    [ "$out" = "$expected" ] || { mark_fail "$case_name" "expected '$expected', got '$out'"; return; }
+    mark_pass "$case_name"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Case 10: a unique v2 child wins over a v1-pair sibling.
+# ---------------------------------------------------------------------------
+case_10() {
+  local case_name="resolve_ops_root: unique v2 child wins over v1 sibling"
+  local outer fork portfolio expected
+  outer=$(mktemp -d)
+  fork="$outer/fork"
+  portfolio="$outer/portfolio"
+  mkdir -p "$fork" "$portfolio"
+  git init -q "$outer"
+  : > "$fork/.apexyard-fork"
+  : > "$portfolio/onboarding.yaml"
+  : > "$portfolio/apexyard.projects.yaml"
+  expected=$(cd "$fork" && pwd -P)
+  (
+    # shellcheck source=/dev/null
+    . "$LIB"
+    out=$(cd "$fork" && resolve_ops_root_walk)
+    [ "$out" = "$expected" ] || { mark_fail "$case_name (from fork)" "expected '$expected', got '$out'"; return; }
+    out=$(cd "$outer" && resolve_ops_root)
+    [ "$out" = "$expected" ] || { mark_fail "$case_name (from enclosing repo)" "expected '$expected', got '$out'"; return; }
+    mark_pass "$case_name"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Case 11: multiple v2 children remain ambiguous.
+# ---------------------------------------------------------------------------
+case_11() {
+  local case_name="resolve_ops_root: multiple v2 children remain ambiguous"
+  local outer
+  outer=$(mktemp -d)
+  mkdir -p "$outer/fork-a" "$outer/fork-b"
+  git init -q "$outer"
+  : > "$outer/fork-a/.apexyard-fork"
+  : > "$outer/fork-b/.apexyard-fork"
+  (
+    # shellcheck source=/dev/null
+    . "$LIB"
+    out=$(cd "$outer" && resolve_ops_root_walk)
+    [ -z "$out" ] || { mark_fail "$case_name" "expected no result, got '$out'"; return; }
+    mark_pass "$case_name"
+  )
+}
+
 echo "Running ops-root lib tests..."
-for fn in case_1 case_2 case_3 case_4 case_5 case_6 case_7 case_8; do
+for fn in case_1 case_2 case_3 case_4 case_5 case_6 case_7 case_8 case_9 case_10 case_11; do
   run_case "$fn"
 done
 

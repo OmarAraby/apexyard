@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # PreToolUse hook on `git commit -m / -F`: scans the commit message for
 # issue references (Closes #N, Refs #N, Fixes #N, Resolves #N, Related to #N)
 # and blocks the commit if any reference points at an issue that doesn't
@@ -29,15 +30,31 @@
 # Short-circuit: try the primary tracker first, only fall back to upstream on
 # miss. No double query for refs that resolve in origin.
 
-INPUT=$(cat)
+# Run one target check. The visitor isolates each call in a subshell.
+_git_gate_body() {
+INPUT="$_GIT_GATE_INPUT"
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
 if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-# Only check on git commit
-if ! echo "$COMMAND" | grep -qE '\bgit\s+commit\b'; then
+# Only check on git commit. Also recognizes `git -C <path> commit` (quoted
+# or bare) — a bare `\bgit\s+commit\b` check misses this shape entirely
+# (the `-C <path>` sits between "git" and "commit", so the two tokens are
+# never adjacent), which meant a commit made via explicit `-C` — exactly
+# the pattern a worktree-based sub-agent uses (me2resh/apexyard#1050) —
+# skipped ref verification altogether, regardless of any cwd-resolution fix
+# below. Round-3 review caught this: the WORKDIR resolver's `-C`-bound-to-
+# commit priority level was otherwise unreachable in practice.
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -r "$HOOK_DIR/_lib-git-global.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOOK_DIR/_lib-git-global.sh"
+fi
+if command -v command_has_git_subcommand >/dev/null 2>&1; then
+  command_has_git_subcommand "$COMMAND" commit || exit 0
+elif ! echo "$COMMAND" | grep -qE '\bgit[[:space:]]+(-C[[:space:]]+("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)[[:space:]]+)?commit\b'; then
   exit 0
 fi
 
@@ -121,6 +138,190 @@ if [ -z "$REFS" ]; then
   exit 0
 fi
 
+# Resolve the WORKING DIRECTORY the `git commit` is actually executing in —
+# NOT the hook process's own cwd (me2resh/apexyard#1050). In a
+# split-portfolio / worktree-based sub-agent session, the harness's Bash cwd
+# for this call can be a managed project's worktree while the hook process
+# itself inherits a different cwd (typically the ops fork). Every
+# cwd-relative git call below must run against the COMMIT's directory, not
+# wherever this script happened to start.
+#
+# Priority (highest first) — me2resh/apexyard#1340 / AgDR-0163. PR #1073
+# ranked harness `.cwd` above a this-commit `-C` because scrape hijacks were
+# still open. Those hijacks now have separate mitigations (message strip,
+# `-C` bound to THIS `commit` token, absolute paths only). An explicit
+# `git -C <path> commit` names the repository the commit writes. The
+# harness `.cwd` is the session directory. Ranking `.cwd` first made the
+# `-C` parser unreachable in Claude Code and Cursor, where `.cwd` is always
+# set and absolute. That is #1050 recurring.
+#
+# The scrape is still constrained:
+#   - a commit MESSAGE containing `git -C <dir>` is stripped before scan
+#   - `git commit -m "..." && git -C /other log` does not bind `/other`
+#   - `cd /real && git -C /other status && git commit` keeps `/real`
+#   - a relative `cd ../sibling` is not trusted
+#
+# Priority now:
+#   1. `git -C <path>` bound DIRECTLY to this commit invocation
+#      (`git -C <path> commit`), scraped from the command with the commit
+#      MESSAGE stripped out first, and matched only when the `-C` is the
+#      last thing before THIS `commit` token.
+#   2. the LAST `cd <path>` occurring before this commit invocation, same
+#      message-stripped, same-invocation-only scoping.
+#   3. the harness-provided `.cwd` (`.tool_input.cwd`) for this Bash call.
+#   4. fall back to the hook's own process cwd — IDENTICAL to the pre-fix
+#      behavior, so a session with no worktree involved sees no change.
+# Only ABSOLUTE paths are trusted out of (1)-(3); a relative path is
+# ambiguous about what it's relative TO, so it's treated as absent rather
+# than resolved against the hook's own cwd via a coincidental `-d` pass.
+
+# Strip the commit message out of COMMAND before any scraping below — a
+# literal, non-regex substring removal. Deliberately NOT `awk -v` on the raw
+# content: POSIX awk's `-v`/command-line-operand assignment undergoes its
+# own escape-sequence processing, which can silently mangle a message
+# containing backslash sequences (a commit message describing THIS hook is
+# exactly that kind of text — see #1073's review). Both values are piped in
+# through stdin instead, joined by a private sentinel, and sliced with
+# index()/substr() so nothing is ever regex- or escape-interpreted.
+strip_message_from_command() {
+  local cmd="$1" msg="$2" sep="__apexyard_1050_msg_boundary__"
+  if [ -z "$msg" ]; then
+    printf '%s' "$cmd"
+    return
+  fi
+  printf '%s%s%s' "$cmd" "$sep" "$msg" | awk -v sep="$sep" '
+    { buf = (NR == 1 ? $0 : buf "\n" $0) }
+    END {
+      sidx = index(buf, sep)
+      if (sidx == 0) { printf "%s", buf; exit }
+      c = substr(buf, 1, sidx - 1)
+      m = substr(buf, sidx + length(sep))
+      midx = index(c, m)
+      if (midx > 0 && length(m) > 0) {
+        printf "%s%s", substr(c, 1, midx - 1), substr(c, midx + length(m))
+      } else {
+        printf "%s", c
+      }
+    }
+  '
+}
+
+# Extract a governing directory from the (message-stripped) command, bound
+# to THIS commit invocation only. Only the portion of the command BEFORE
+# the first `commit` TOKEN is considered — a `-C` / `cd` at or after that
+# point belongs to a later command in the same compound line and must not
+# be read as governing this one.
+#
+# The cut point MUST be a token boundary, not a bare substring search. An
+# earlier version of this function used `${cmd%%commit*}`, which cuts at
+# the first literal SUBSTRING "commit" — truncating mid-path for any
+# directory name that merely CONTAINS that substring (`commitizen`,
+# `pre-commit-hooks`, `commitlint`, `commits-repo`, ...). That failure is
+# fail-OPEN: the truncated parent is usually not a git repo, so the caller
+# falls through to the "could not resolve tracker repo — skipping" branch
+# and ref verification is silently disabled (me2resh/apexyard#1050 review,
+# round 3). A leading space is prepended so the boundary pattern
+# `[[:space:]]commit([[:space:]]|$)` can require a preceding space
+# uniformly, with no special case for "commit" occurring at position 0.
+resolve_commit_workdir_from_command() {
+  local cmd="$1" padded pos prefix dir
+  padded=" $cmd"
+  pos=$(printf '%s' "$padded" | awk '
+    { buf = (NR == 1 ? $0 : buf "\n" $0) }
+    END {
+      if (match(buf, /[[:space:]]commit([[:space:]]|$)/)) {
+        print RSTART
+      } else {
+        print 0
+      }
+    }
+  ')
+  if [ "$pos" -gt 1 ] 2>/dev/null; then
+    # RSTART (1-based, in PADDED) points at the whitespace char immediately
+    # before the "commit" token. padded[2..pos] == cmd[1..pos-1] — the
+    # commit's own leading directory hints, with the artificial leading
+    # space dropped.
+    prefix=$(printf '%s' "$padded" | cut -c "2-${pos}")
+  else
+    # No bounded "commit" token found at all (e.g. it only ever appeared
+    # inside the now-stripped message) — nothing to bound against; fall
+    # through to scanning the whole (message-stripped) string, same as
+    # before this token-boundary fix existed.
+    prefix="$cmd"
+  fi
+
+  # `-C <path>` on THIS commit, including when another global option sits
+  # between -C and commit (`git -C <path> -c name=value commit`). The helper
+  # binds -C to the commit verb, so an earlier `git -C /other status` does
+  # not match. Only an absolute path is trusted (AgDR-0163).
+  dir=""
+  if command -v git_invocation_dash_c >/dev/null 2>&1; then
+    dir=$(git_invocation_dash_c "${prefix} commit" commit)
+  elif echo "$prefix" | grep -qE 'git[[:space:]]+-C[[:space:]]+"[^"]*"[[:space:]]*$'; then
+    dir=$(echo "$prefix" | sed -E 's/^.*git[[:space:]]+-C[[:space:]]+"([^"]*)"[[:space:]]*$/\1/')
+  elif echo "$prefix" | grep -qE "git[[:space:]]+-C[[:space:]]+'[^']*'[[:space:]]*\$"; then
+    dir=$(echo "$prefix" | sed -E "s/^.*git[[:space:]]+-C[[:space:]]+'([^']*)'[[:space:]]*\$/\1/")
+  elif echo "$prefix" | grep -qE 'git[[:space:]]+-C[[:space:]]+[^[:space:]]+[[:space:]]*$'; then
+    dir=$(echo "$prefix" | sed -E 's/^.*git[[:space:]]+-C[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/')
+  fi
+  if [ -n "$dir" ] && [ "${dir#/}" != "$dir" ]; then
+    echo "$dir"
+    return
+  fi
+
+  # Last `cd <path>` occurring anywhere before this commit invocation.
+  dir=""
+  if echo "$prefix" | grep -qE '(^|&&|;)[[:space:]]*cd[[:space:]]+"[^"]*"'; then
+    dir=$(echo "$prefix" | grep -oE '(^|&&|;)[[:space:]]*cd[[:space:]]+"[^"]*"' | tail -1 | sed -E 's/^(&&|;)?[[:space:]]*cd[[:space:]]+"([^"]*)"$/\2/')
+  elif echo "$prefix" | grep -qE "(^|&&|;)[[:space:]]*cd[[:space:]]+'[^']*'"; then
+    dir=$(echo "$prefix" | grep -oE "(^|&&|;)[[:space:]]*cd[[:space:]]+'[^']*'" | tail -1 | sed -E "s/^(&&|;)?[[:space:]]*cd[[:space:]]+'([^']*)'\$/\2/")
+  elif echo "$prefix" | grep -qE '(^|&&|;)[[:space:]]*cd[[:space:]]+[^[:space:]&|;]+'; then
+    dir=$(echo "$prefix" | grep -oE '(^|&&|;)[[:space:]]*cd[[:space:]]+[^[:space:]&|;]+' | tail -1 | sed -E 's/^(&&|;)?[[:space:]]*cd[[:space:]]+//')
+  fi
+  if [ -n "$dir" ] && [ "${dir#/}" != "$dir" ]; then
+    echo "$dir"
+    return
+  fi
+}
+
+PAYLOAD_CWD=$(echo "$INPUT" | jq -r '.cwd // .tool_input.cwd // empty' 2>/dev/null)
+CMD_SANS_MSG=$(strip_message_from_command "$COMMAND" "$MSG")
+
+# 1 & 2. This-commit `-C` / `cd` scrape first (AgDR-0163). An explicit
+# `git -C <path> commit` outranks the ambient harness cwd.
+# WORKDIR_SOURCE distinguishes "we resolved a hint" from "nothing resolved
+# and we fell back" — used below to give the "could not resolve tracker
+# repo" warning a sharper message when a HINT was found but didn't pan out
+# (e.g. it resolved to a directory with no git origin at all), versus the
+# unremarkable case where no hint existed and the fallback is expected.
+WORKDIR=""
+WORKDIR_SOURCE="fallback"
+WORKDIR=$(resolve_commit_workdir_from_command "$CMD_SANS_MSG")
+if command -v git_prepare_invocation >/dev/null 2>&1; then
+  git_prepare_invocation "$COMMAND" commit "${PAYLOAD_CWD:-}"
+  if [ -n "${GIT_DASH_C:-}" ]; then
+    WORKDIR="$GIT_DASH_C"
+  fi
+fi
+if [ -n "$WORKDIR" ]; then
+  WORKDIR_SOURCE="scraped_command"
+elif [ -n "$PAYLOAD_CWD" ] && [ "${PAYLOAD_CWD#/}" != "$PAYLOAD_CWD" ]; then
+  # 3. Harness `.cwd` when the scrape found no this-commit path.
+  WORKDIR="$PAYLOAD_CWD"
+  WORKDIR_SOURCE="payload_cwd"
+fi
+# 4. No hint resolved anything usable — fall back to this process's own cwd,
+# exactly what every git call below did before this fix.
+if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
+  if [ -n "$WORKDIR" ]; then
+    # A hint WAS found (payload .cwd or scraped command) but the directory
+    # doesn't even exist — worth remembering for the warning below, since
+    # this is exactly the shape a truncated/incorrect scrape produces.
+    WORKDIR_SOURCE="${WORKDIR_SOURCE}_unresolvable:${WORKDIR}"
+  fi
+  WORKDIR="$PWD"
+fi
+
 # Resolve tracker repo.
 #
 # Two roots come into play:
@@ -133,13 +334,23 @@ fi
 #     operator configured Linear / Jira / Asana / custom at the ops-fork
 #     level (me2resh/apexyard#310). _lib-ops-root.sh walks up to the
 #     ops-fork anchor (v2 marker or v1 pair) and is the right primitive.
+#     Both REPO_ROOT and the resolve_ops_root walk now start from WORKDIR
+#     (the commit's own directory) instead of $PWD — see above.
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+commit_repo_git() {
+  if command -v git_target >/dev/null 2>&1 && [ -n "${GIT_DASH_C:-}${_GIT_RAW_GIT_DIR:-}${_GIT_RAW_WORK_TREE:-}" ]; then
+    git_target "$@"
+  else
+    git -C "$WORKDIR" "$@"
+  fi
+}
+
+REPO_ROOT=$(commit_repo_git rev-parse --show-toplevel 2>/dev/null)
 CONFIG_ROOT=""
 if [ -f "$HOOK_DIR/_lib-ops-root.sh" ]; then
   # shellcheck disable=SC1090,SC1091
   . "$HOOK_DIR/_lib-ops-root.sh"
-  CONFIG_ROOT=$(resolve_ops_root "$PWD")
+  CONFIG_ROOT=$(resolve_ops_root "$WORKDIR")
 fi
 if [ -z "$CONFIG_ROOT" ]; then
   CONFIG_ROOT="$REPO_ROOT"
@@ -150,7 +361,7 @@ if [ -n "$CONFIG_ROOT" ] && [ -f "${CONFIG_ROOT}/.claude/project-config.json" ];
   TRACKER_REPO=$(jq -r '.tracker_repo // empty' "${CONFIG_ROOT}/.claude/project-config.json" 2>/dev/null)
 fi
 if [ -z "$TRACKER_REPO" ]; then
-  ORIGIN_URL=$(git remote get-url origin 2>/dev/null)
+  ORIGIN_URL=$(commit_repo_git remote get-url origin 2>/dev/null)
   TRACKER_REPO=$(echo "$ORIGIN_URL" | sed -nE 's|.*[:/]([^/:]+/[^/]+)\.git$|\1|p; s|.*[:/]([^/:]+/[^/]+)$|\1|p' | head -1)
 fi
 
@@ -177,8 +388,25 @@ fi
 # `tracker.kind = gh` (default) still requires an origin / configured repo;
 # preserve today's behaviour. For non-gh kinds the {owner_repo} placeholder
 # in the configured view_command may be unused, so we don't gate on it.
+#
+# The message distinguishes "no cwd/-C/cd hint existed at all" (WORKDIR_SOURCE
+# = fallback; unremarkable, this is the ordinary interactive/local-repo case)
+# from "a hint WAS resolved but it doesn't have a usable git origin"
+# (payload_cwd / scraped_command, or the *_unresolvable:<dir> shape when the
+# resolved directory didn't even exist) — the latter is worth a sharper
+# signal, since a truncated or mis-scraped directory hint silently landing
+# here (ref verification skipped, not blocked) is exactly the failure class
+# a prior version of this fix introduced (me2resh/apexyard#1050 review,
+# round 3: a path substring-matching "commit" got truncated mid-directory).
 if [ "$TRACKER_KIND" = "gh" ] && [ -z "$TRACKER_REPO" ]; then
-  echo "WARN: verify-commit-refs.sh could not resolve tracker repo. Skipping." >&2
+  case "$WORKDIR_SOURCE" in
+    fallback)
+      echo "WARN: verify-commit-refs.sh could not resolve tracker repo. Skipping." >&2
+      ;;
+    *)
+      echo "WARN: verify-commit-refs.sh resolved a working-directory hint (source: ${WORKDIR_SOURCE}, dir: ${WORKDIR}) but it has no usable git origin — skipping ref verification. If this directory looks truncated or wrong, that's a bug in the cwd/-C/cd scraper, not a config problem." >&2
+      ;;
+  esac
   exit 0
 fi
 
@@ -189,8 +417,8 @@ fi
 # Upstream fallback only applies to the gh kind. Linear / Jira / Asana
 # don't have a fork-of-a-tracker concept.
 UPSTREAM_REPO=""
-if [ "$TRACKER_KIND" = "gh" ] && git remote get-url upstream >/dev/null 2>&1; then
-  UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null)
+if [ "$TRACKER_KIND" = "gh" ] && commit_repo_git remote get-url upstream >/dev/null 2>&1; then
+  UPSTREAM_URL=$(commit_repo_git remote get-url upstream 2>/dev/null)
   UPSTREAM_REPO=$(echo "$UPSTREAM_URL" | sed -nE 's|.*[:/]([^/:]+/[^/]+)\.git$|\1|p; s|.*[:/]([^/:]+/[^/]+)$|\1|p' | head -1)
   # Don't double-check if upstream resolves to the same repo as the primary
   # tracker (e.g. running INSIDE the framework repo itself, where origin and
@@ -210,13 +438,34 @@ fi
 MISSING=""
 CLOSED=""
 SHAPE_ONLY=""
+# Capture the tracker CLI's own stderr instead of discarding it, so the paths
+# below that block or warn can name the real cause (#1336). A ref that resolves
+# on the upstream fallback (#207) never records anything, so the ordinary
+# fork-to-upstream case stays silent.
+#
+# The snapshot matters: `2>` truncates on open, so a later ref's lookup — even a
+# successful one that writes nothing — would otherwise wipe the error belonging
+# to the ref that actually went missing. Copy the text out at the moment a ref
+# fails, and report that.
+# Redirect to /dev/null when mktemp fails, rather than to an empty path, which
+# bash reports as an ambiguous redirect on every lookup. The trap is set ONLY
+# when mktemp succeeded: an unconditional trap would run `rm -f /dev/null`,
+# which under root removes the device node and turns every later redirect to
+# /dev/null on that host into a regular file.
+if TRACKER_ERR=$(mktemp); then
+  trap 'rm -f "$TRACKER_ERR"' EXIT
+else
+  TRACKER_ERR=/dev/null
+fi
+TRACKER_ERR_TEXT=""
+
 for REF in $REFS; do
   NUM=$(echo "$REF" | tr -d '#')
   # Dispatch via the tracker lib. For non-gh kinds `--repo` may be a no-op.
-  ISSUE_JSON=$(tracker_view "$NUM" "$TRACKER_REPO" 2>/dev/null)
+  ISSUE_JSON=$(tracker_view "$NUM" "$TRACKER_REPO" 2>"$TRACKER_ERR")
   # Short-circuit: only consult upstream when the primary tracker missed.
   if [ -z "$ISSUE_JSON" ] && [ -n "$UPSTREAM_REPO" ]; then
-    ISSUE_JSON=$(tracker_view "$NUM" "$UPSTREAM_REPO" 2>/dev/null)
+    ISSUE_JSON=$(tracker_view "$NUM" "$UPSTREAM_REPO" 2>"$TRACKER_ERR")
   fi
   if [ -z "$ISSUE_JSON" ] && [ "$TRACKER_KIND" != "gh" ]; then
     # Non-gh tracker (Linear / Jira / Asana / custom) returned nothing — the
@@ -226,10 +475,12 @@ for REF in $REFS; do
     # Hard existence enforcement (adding to MISSING → exit 2) is retained ONLY
     # for tracker.kind == gh.
     SHAPE_ONLY="${SHAPE_ONLY}${REF} "
+    [ -s "$TRACKER_ERR" ] && TRACKER_ERR_TEXT=$(cat "$TRACKER_ERR")
     continue
   fi
   if [ -z "$ISSUE_JSON" ]; then
     MISSING="${MISSING}${REF} "
+    [ -s "$TRACKER_ERR" ] && TRACKER_ERR_TEXT=$(cat "$TRACKER_ERR")
     continue
   fi
   ISSUE_STATE=$(echo "$ISSUE_JSON" | jq -r '.state // empty' 2>/dev/null)
@@ -266,11 +517,19 @@ and use the returned number in your commit message.
 If the reference is truly informational (cross-repo link that can't be verified
 with \`gh issue view\`), write it as a plain URL instead of #N notation.
 MSG
+  if [ -n "$TRACKER_ERR_TEXT" ]; then
+    echo "Tracker CLI said:" >&2
+    printf '%s\n' "$TRACKER_ERR_TEXT" | sed 's/^/  /' >&2
+  fi
   exit 2
 fi
 
 if [ -n "$SHAPE_ONLY" ]; then
   echo "WARN: verify-commit-refs.sh: tracker '${TRACKER_KIND}' not queryable here — ${SHAPE_ONLY}accepted on shape only (no existence check). See #501." >&2
+  if [ -n "$TRACKER_ERR_TEXT" ]; then
+    echo "Tracker CLI said:" >&2
+    printf '%s\n' "$TRACKER_ERR_TEXT" | sed 's/^/  /' >&2
+  fi
 fi
 
 if [ -n "$CLOSED" ]; then
@@ -285,3 +544,17 @@ MSG
 fi
 
 exit 0
+
+}
+
+_GIT_GATE_INPUT=$(cat)
+_GIT_GATE_LIB="$(cd "$(dirname "$0")" && pwd)/_lib-git-global.sh"
+if [ -r "$_GIT_GATE_LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$_GIT_GATE_LIB"
+fi
+if command -v git_visit_invocations >/dev/null 2>&1; then
+  git_visit_invocations _git_gate_body block "$_GIT_GATE_INPUT" commit
+  exit $?
+fi
+_git_gate_body

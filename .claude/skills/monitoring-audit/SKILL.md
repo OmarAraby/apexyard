@@ -6,6 +6,8 @@ argument-hint: "[project-path]"
 effort: medium
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /monitoring-audit — Observability & Incident Readiness
 
 Deep-dive observability analysis. Checks that production issues will be detected, alerted on, and resolvable. Invoke when `/launch-check`'s monitoring row shows WARN or FAIL.

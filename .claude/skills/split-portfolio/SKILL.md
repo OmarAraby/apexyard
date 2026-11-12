@@ -6,6 +6,8 @@ argument-hint: "[--verify | --dry-run]"
 effort: high
 ---
 
+Writing: read docs/skills/shared/writing-rule.md before you write a durable artifact.
+
 # /split-portfolio — Migrate to split-portfolio mode
 
 Automates the recovery flow for ApexYard adopters who hit the **trip-wire** documented in `docs/multi-project.md` — pushed private project names to a public fork, then realized GitHub Free disallows fork-visibility changes.
@@ -53,7 +55,10 @@ Refusal at any of these gates is silent on every other check — show only the r
 
 ```bash
 # Only on full / --dry-run modes. --verify is read-only and doesn't need the marker.
-mkdir -p .claude/session && echo "split-portfolio" > .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+mkdir -p "$marker_home/.claude/session" && echo "split-portfolio" > "$skill_marker"
 ```
 
 Clear the marker at the end of the migration (or on a confirmed-abort). If the skill is interrupted mid-flow, the SessionStart hook `clear-bootstrap-marker.sh` clears it at the start of the next session. See AgDR-0011 + me2resh/apexyard#150.
@@ -338,7 +343,14 @@ cat > .claude/project-config.json <<JSON
 }
 JSON
 
-git add .gitignore .claude/project-config.json
+# NOTE (me2resh/apexyard#1031): .claude/project-config.json is deliberately
+# NOT staged. It is gitignored and untracked upstream, so `git add` on it
+# exits 1 — git still stages the other paths, but the non-zero exit stops
+# this step and the commit below never runs. It is also the wrong file to
+# commit here: the block just written names the PRIVATE sibling repo's path,
+# and this ops fork may be public. Never `git add -f` it — that restores the
+# tracked copy whose overwrite-on-checkout is the data loss #1031 fixed.
+git add .gitignore
 git commit -m "chore: configure split-portfolio mode (#143 / #145)"
 ```
 
@@ -417,12 +429,13 @@ Idempotence: empty `workspace/` (no entries to move, or only `README.md` left) i
 ```bash
 NEEDS=()
 grep -qxF onboarding.yaml .gitignore 2>/dev/null || NEEDS+=(onboarding.yaml)
-grep -qxF workspace .gitignore 2>/dev/null || NEEDS+=(workspace)
+grep -qxF 'workspace/*' .gitignore 2>/dev/null || NEEDS+=('workspace/*')
+grep -qxF '!workspace/README.md' .gitignore 2>/dev/null || NEEDS+=('!workspace/README.md')
 
 if [ "${#NEEDS[@]}" -gt 0 ]; then
   {
     echo ""
-    echo "# Split-portfolio v2 (framework ≥ #242): onboarding + workspace live in the private sibling repo."
+    echo "# Split-portfolio v2 (framework ≥ #242): onboarding + workspace entries live in the private sibling repo."
     for n in "${NEEDS[@]}"; do echo "$n"; done
   } >> .gitignore
   git add .gitignore
@@ -528,10 +541,13 @@ The `--dry-run` flag walks through every step printing the commands but executes
 ## Cleanup (REQUIRED before exit)
 
 ```bash
-rm -f .claude/session/active-bootstrap
+marker_home="$(git rev-parse --show-toplevel)"
+. "$marker_home/.claude/hooks/_lib-session-markers.sh"
+skill_marker=$(active_bootstrap_marker_path "$marker_home") || { echo "A session id is required. Restart through the harness adapter." >&2; exit 2; }
+rm -f "$skill_marker"
 ```
 
-Run on every exit path (successful migration, confirmed abort, refusal-in-flight). If the skill is interrupted before this step, `clear-bootstrap-marker.sh` clears the stale marker on the next session.
+Run on every exit path (successful migration, confirmed abort, refusal-in-flight). If the skill is interrupted before this step, `clear-bootstrap-marker.sh` clears the marker when the same session restarts.
 
 ## Rules
 
