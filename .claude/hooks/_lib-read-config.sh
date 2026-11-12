@@ -135,7 +135,9 @@ config_get() {
     # document and config_get returns empty for EVERY key, silently dropping all
     # project-config overrides (incl. split-portfolio portfolio.* paths).
     # See me2resh/apexyard#629.
-    printf '%s' "$_CONFIG_CACHE" | jq -r "$filter" 2>/dev/null
+    # tr -d '\r': Windows jq.exe writes CRLF line endings, which leave a
+    # trailing \r on every value and break regex/equality checks in callers.
+    printf '%s' "$_CONFIG_CACHE" | jq -r "$filter" 2>/dev/null | tr -d '\r'
   else
     return 0
   fi
