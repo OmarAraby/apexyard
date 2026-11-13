@@ -130,6 +130,16 @@ DENY="a review-class agent may use ${TOOL:-this tool} only to write its review b
 
 [ -n "$TARGET" ] || lrw_block "the edit has no target path. $DENY"
 
+# Windows drops a trailing dot or space from a path segment, so `bodies.`
+# can name the body folder. Probes on Windows 11 found no segment that
+# escapes the folder, but the string checks here cannot tell a stripped
+# segment from a literal one. Block every segment that ends in a dot or a
+# space, on the raw path, instead of relying on the OS
+# (OmarAraby/apexyard#8, AgDR-0275).
+case "$(printf '%s' "$TARGET" | tr '\\' '/')/" in
+  *./*|*" "/*) lrw_block "a path segment ends in a dot or a space. $DENY" ;;
+esac
+
 # Claude Code on Windows sends the Write path as C:\... or C:/... . That form
 # is absolute, but the /* test below rejected it, so no review agent could
 # write a body on Windows (OmarAraby/apexyard#4). Map it to the POSIX form
@@ -144,9 +154,13 @@ case "$TARGET" in
     case "/$(printf '%s' "$TARGET" | tr '\\' '/')/" in
       */../*|*/./*) lrw_block "the path has a . or .. segment. $DENY" ;;
     esac
-    if command -v _windows_path_to_posix >/dev/null 2>&1; then
-      TARGET=$(_windows_path_to_posix "$TARGET")
-    fi
+    case "${OSTYPE:-}" in
+      msys*|cygwin*)
+        if command -v _windows_path_to_posix >/dev/null 2>&1; then
+          TARGET=$(_windows_path_to_posix "$TARGET")
+        fi
+        ;;
+    esac
     ;;
 esac
 
