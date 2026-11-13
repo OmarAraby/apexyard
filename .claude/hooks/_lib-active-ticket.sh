@@ -438,7 +438,7 @@ _at_validate_w_body() {
     _at_gitfile "$W/.git" || { _at_fail "not a git tree (malformed .git file)"; return 1; }
     p="$REPLY"
     case "$p" in
-      /*) ;;
+      /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
       *) p="$W/$p" ;;
     esac
     _at_rp "$p" || return 1
@@ -447,7 +447,7 @@ _at_validate_w_body() {
       _at_readfirst "$G/commondir" || { _at_fail "not a git tree (empty commondir)"; return 1; }
       p="$REPLY"
       case "$p" in
-        /*) ;;
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
         *) p="$G/$p" ;;
       esac
       _at_rp "$p" || return 1
@@ -545,7 +545,7 @@ _at_validate_w_body() {
     _at_readfirst "$G/gitdir" || { _at_fail "worktree not listed"; return 1; }
     p="$REPLY"
     case "$p" in
-      /*) ;;
+      /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
       *) p="$G/$p" ;;
     esac
     _at_rp "$p" || { _at_fail "worktree not listed"; return 1; }
@@ -580,7 +580,7 @@ _at_entry_match() {
     case "$ew" in
       '') continue ;;
       '~'*) continue ;;
-      /*) p="$ew" ;;
+      /*|[A-Za-z]:/*|[A-Za-z]:\\*) p="$ew" ;;
       *) [ -n "$_AT_OPS" ] || continue; p="$_AT_OPS/${ew#./}" ;;
     esac
     p="${p%/}"
@@ -956,7 +956,7 @@ active_ticket_project_clone() {
       en="${en%%$'\t'*}"
       [ "$en" = "$name" ] || continue
       case "$ew" in
-        /*) REPLY="${ew%/}"; return 0 ;;
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*) REPLY="${ew%/}"; return 0 ;;
         ''|'~'*) ;;
         *) [ -z "$_AT_OPS" ] || { REPLY="$_AT_OPS/${ew#./}"; REPLY="${REPLY%/}"; return 0; } ;;
       esac
@@ -991,7 +991,7 @@ active_ticket_project_markers() {
       lines="${lines#*$'\n'}"
       ew="${ew#*$'\t'}"
       case "$ew" in
-        /*) cands="$cands$ew"$'\n' ;;
+        /*|[A-Za-z]:/*|[A-Za-z]:\\*) cands="$cands$ew"$'\n' ;;
         ''|'~'*) ;;
         *) [ -z "$_AT_OPS" ] || cands="$cands$_AT_OPS/${ew#./}"$'\n' ;;
       esac

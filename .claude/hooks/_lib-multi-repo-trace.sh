@@ -277,7 +277,7 @@ mrt_workspace_for() {
       local candidate=""
       if [ -n "$workspace" ]; then
         case "$workspace" in
-          /*) candidate="$workspace" ;;
+          /*|[A-Za-z]:/*|[A-Za-z]:\\*) candidate="$workspace" ;;
           *)
             local root
             root=$(_portfolio_root 2>/dev/null) || root=""
