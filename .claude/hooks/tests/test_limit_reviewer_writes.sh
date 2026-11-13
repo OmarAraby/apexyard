@@ -23,6 +23,12 @@ TMP_RAW=$(mktemp -d "${TMPDIR:-/tmp}/apexyard-reviewer-writes.XXXXXX")
 TMP=$(cd "$TMP_RAW" && pwd -P)
 trap 'rm -rf "$TMP"' EXIT
 
+# The hook converts a drive-letter path only when OSTYPE is msys or cygwin
+# (OmarAraby/apexyard#8). bash sets OSTYPE itself, but an inherited value is
+# kept, so the tests pass it to the hook: msys by default, so the Windows
+# cases run on every host, and linux-gnu in the non-Windows cases.
+T_OSTYPE=msys
+
 PASS=0
 FAIL=0
 ok() { echo "PASS: $1"; PASS=$((PASS + 1)); }
@@ -65,7 +71,7 @@ payload() {
 # expect <name> <allowed|blocked> <payload>
 expect() {
   local name="$1" want="$2" input="$3" out rc
-  out=$(cd "$OPS" && printf '%s' "$input" | CLAUDE_CODE_SESSION_ID=s1 /bin/bash "$HOOK" 2>&1)
+  out=$(cd "$OPS" && printf '%s' "$input" | OSTYPE="$T_OSTYPE" CLAUDE_CODE_SESSION_ID=s1 /bin/bash "$HOOK" 2>&1)
   rc=$?
   if [ "$want" = allowed ] && [ "$rc" -eq 0 ]; then
     ok "$name"
@@ -223,6 +229,25 @@ mv "$OPS/.claude/hooks/_lib-path-resolve.sh" "$TMP/path-lib.bak"
 expect "windows: no path library: a body as Z:\\... is blocked" blocked \
   "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
 mv "$TMP/path-lib.bak" "$OPS/.claude/hooks/_lib-path-resolve.sh"
+
+# On a non-Windows shell the hook does not convert a drive-letter path, even
+# with a cygpath on PATH that would map it onto a real body file. The Write
+# tool may read C:/x as a relative path there, so the hook must not read it
+# as /c/x (OmarAraby/apexyard#8, AgDR-0275).
+T_OSTYPE=linux-gnu
+expect "non-windows: a body as Z:/... is not converted and is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_FS/.claude/session/reviews/bodies/$BODY_NAME")"
+expect "non-windows: a body as Z:\\... is not converted and is blocked" blocked \
+  "$(payload code-reviewer Write "$WIN_BS\\.claude\\session\\reviews\\bodies\\$BODY_NAME")"
+expect "non-windows: C:/x is not treated as the ops path" blocked \
+  "$(payload code-reviewer Write "C:/x")"
+# MSYS would rewrite a /c/... argument to C:/... in the jq call, so keep the path as is.
+expect "non-windows: a POSIX body path is still allowed" allowed \
+  "$(MSYS2_ARG_CONV_EXCL='*' payload code-reviewer Write "$BODIES/$BODY_NAME")"
+T_OSTYPE=cygwin
+expect "cygwin shell: a body as Z:/... is converted and allowed" allowed \
+  "$(payload code-reviewer Write "$WIN_FS/.claude/session/reviews/bodies/$BODY_NAME")"
+T_OSTYPE=msys
 PATH=$OLD_PATH
 unset FAKE_DRIVE_ROOT
 
@@ -238,9 +263,51 @@ if command -v cygpath >/dev/null 2>&1 && REAL_WIN=$(cygpath -w "$OPS" 2>/dev/nul
     "$(payload code-reviewer Write "$REAL_WIN\\.claude\\session\\reviews\\bodies\\x\\..\\y.md")"
   expect "real windows: a repo file is blocked" blocked \
     "$(payload code-reviewer Write "$REAL_WIN\\README.md")"
+  # A literal /c/... path. MSYS rewrites a /c/ argument to C:/ when it starts
+  # a non-MSYS program such as jq, so switch the conversion off to build the
+  # payload. The hook then receives /c/... unconverted.
+  REAL_WIN_FS=$(printf '%s' "$REAL_WIN" | tr '\\' '/')
+  LIT_DRIVE=$(printf '%s' "${REAL_WIN_FS%%:*}" | tr '[:upper:]' '[:lower:]')
+  LIT_OPS="/$LIT_DRIVE${REAL_WIN_FS#?:}"
+  LIT_INPUT=$(MSYS2_ARG_CONV_EXCL='*' payload code-reviewer Write "$LIT_OPS/.claude/session/reviews/bodies/$BODY_NAME")
+  if printf '%s' "$LIT_INPUT" | MSYS2_ARG_CONV_EXCL='*' jq -e --arg p "$LIT_OPS/.claude/session/reviews/bodies/$BODY_NAME" '.tool_input.file_path == $p' >/dev/null 2>&1; then
+    ok "real windows: the test payload keeps the literal /$LIT_DRIVE/ path"
+  else
+    bad "real windows: the payload was rewritten before it reached the hook"
+  fi
+  expect "real windows: a literal /$LIT_DRIVE/... body path is allowed" allowed "$LIT_INPUT"
+  expect "real windows: a literal /$LIT_DRIVE/... repo file is blocked" blocked \
+    "$(MSYS2_ARG_CONV_EXCL='*' payload code-reviewer Write "$LIT_OPS/README.md")"
 else
   echo "NOTE: no cygpath on this host; the fake-cygpath cases above cover drive-letter paths"
 fi
+
+# --- Trailing dots and spaces in path segments (OmarAraby/apexyard#8) --------
+# Windows drops a trailing dot from a segment, so `bodies.` names the body
+# folder. Probes on Windows 11 showed no such segment escapes the folder, but
+# the hook cannot tell a stripped segment from a literal one, so it blocks
+# every segment that ends in a dot or a space. No legitimate body name ends so.
+R="$OPS/.claude/session/reviews"
+expect "a trailing dot on the body folder is blocked" blocked \
+  "$(payload code-reviewer Write "$R/bodies./$BODY_NAME")"
+expect "a trailing space on the body folder is blocked" blocked \
+  "$(payload code-reviewer Write "$R/bodies /$BODY_NAME")"
+expect "a trailing dot on the reviews folder is blocked" blocked \
+  "$(payload code-reviewer Write "$OPS/.claude/session/reviews./bodies/$BODY_NAME")"
+expect "a trailing dot on a sub-folder of bodies is blocked" blocked \
+  "$(payload code-reviewer Write "$BODIES/run./$BODY_NAME")"
+expect "a space-dot-space segment under bodies is blocked" blocked \
+  "$(payload code-reviewer Write "$BODIES/.. /$BODY_NAME")"
+expect "a three-dot segment under bodies is blocked" blocked \
+  "$(payload code-reviewer Write "$BODIES/.../$BODY_NAME")"
+expect "a trailing dot on the file name is blocked" blocked \
+  "$(payload code-reviewer Write "$BODIES/$BODY_NAME.")"
+expect "a trailing space on the file name is blocked" blocked \
+  "$(payload code-reviewer Write "$BODIES/$BODY_NAME ")"
+expect "a trailing dot on a Windows body folder is blocked" blocked \
+  "$(payload code-reviewer Write "Z:\\bodies.\\$BODY_NAME")"
+expect "a name with an inner dot or space is still allowed" allowed \
+  "$(payload code-reviewer Write "$BODIES/run 2/me2resh__apexyard__42-rex.v2.md")"
 
 # --- Part 2: every Write-channel hook, then the Bash dispatcher --------------
 FULL="$TMP/full"
