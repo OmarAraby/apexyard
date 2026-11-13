@@ -92,7 +92,7 @@ _projctx_pair_in_live_registry() {
     [ "$name" = "$want_name" ] || continue
     [ -z "$workspace" ] && continue
     case "$workspace" in
-      /*) ws_abs="$workspace" ;;
+      /*|[A-Za-z]:/*|[A-Za-z]:\\*) ws_abs="$workspace" ;;
       *) ws_abs=""; [ -n "$root" ] && ws_abs="$root/$workspace" ;;
     esac
     [ -z "$ws_abs" ] && continue
@@ -169,7 +169,7 @@ _projctx_registry_tsv() {
     [ -z "$name" ] && continue
     [ -z "$workspace" ] && continue
     case "$workspace" in
-      /*) ws_abs="$workspace" ;;
+      /*|[A-Za-z]:/*|[A-Za-z]:\\*) ws_abs="$workspace" ;;
       *) ws_abs=""; [ -n "$root" ] && ws_abs="$root/$workspace" ;;
     esac
     [ -z "$ws_abs" ] && continue
